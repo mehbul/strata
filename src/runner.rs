@@ -148,6 +148,12 @@ impl Flags {
             "-t".into(),
             self.threads.to_string(),
             "--no-webui".into(),
+            // Render the model's own chat template. Without it llama.cpp
+            // refuses any request carrying `tools` - "tools param requires
+            // --jinja flag" - so a coding agent cannot talk to Strata at all,
+            // and the console's thinking switch, which travels in
+            // `chat_template_kwargs`, has nothing to reach.
+            "--jinja".into(),
         ];
         // A pattern replaces the count rather than adding to it; passing both
         // would place the same tensors twice by two different rules.
@@ -358,6 +364,7 @@ mod tests {
                 "-ngl", "99",
                 "-t", "6",
                 "--no-webui",
+                "--jinja",
                 "-ncmoe", "15",
                 "-fa", "on",
             ]

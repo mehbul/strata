@@ -20,7 +20,7 @@ use axum::{
     Router,
 };
 use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
     convert::Infallible,
@@ -399,10 +399,50 @@ fn default_temp() -> f32 {
 /// context compaction reserves for the answer.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Default)]
 pub struct Msg {
     pub role: String,
+    #[serde(default, deserialize_with = "message_text")]
     pub content: String,
+    /// The rest of the message: `tool_calls` on an assistant turn,
+    /// `tool_call_id` and `name` on a tool result. Strata reads none of it, but
+    /// a coding agent's entire loop is carried in those fields, so they are
+    /// kept beside the text and written back out untouched. Dropping them - as
+    /// naming only `role` and `content` did - leaves the model answering a
+    /// conversation in which it never called a tool and never saw a result.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Msg {
+    /// The message as text, for counting and summarising. A turn that is only
+    /// a tool call carries no content, so the call itself stands in for it;
+    /// otherwise every such turn would measure as zero tokens and vanish from
+    /// a summary.
+    pub fn text(&self) -> String {
+        match self.extra.get("tool_calls") {
+            None => self.content.clone(),
+            Some(calls) if self.content.is_empty() => calls.to_string(),
+            Some(calls) => format!("{}
+{calls}", self.content),
+        }
+    }
+}
+
+/// Read a message's text whatever shape it arrived in. An OpenAI client sends
+/// a string, `null` for a turn that is only a tool call, or an array of content
+/// parts; refusing the last two rejects the whole conversation with a
+/// deserialisation error the client cannot act on.
+fn message_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    })
 }
 
 // --------------------------------------------------------------- endpoints

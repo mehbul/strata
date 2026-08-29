@@ -23,3 +23,6 @@ tuned.json
 # Local state
 .strata_usage*
 .strata_kv*
+
+# pi's project settings - points at a server on this machine
+/.pi

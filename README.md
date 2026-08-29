@@ -7,15 +7,16 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
 [![GPU](https://img.shields.io/badge/GPU-ROCm%20%7C%20Vulkan%20%7C%20CUDA-red.svg)]()
 
-Strata reads the model file itself, works out where its weights should sit across
-VRAM and system RAM, starts and owns the compute process, and serves an
-OpenAI-compatible API plus a web console. It configures itself for whatever
-machine it lands on.
+Strata runs large **MoE GGUF models on consumer AMD Radeon cards** — ROCm on
+Windows, no Ollama and no daemon. It reads the model file itself, works out where
+its weights should sit across VRAM and system RAM, starts and owns the
+llama.cpp compute process, and serves an OpenAI-compatible API plus a web
+console. It configures itself for whatever machine it lands on.
 
 **35B MoE at ~42 tok/s on a 16 GB card, with a 65,536-token window.** No daemon,
 no Ollama.
 
-![The console](docs/console.jpg)
+![Strata's web console streaming from a 35B MoE model on a Radeon RX 7600 XT](docs/console.jpg)
 
 ---
 
@@ -234,7 +235,7 @@ anyway.
 
 ## The console
 
-![Model residency](docs/model-unloaded.png)
+![The console's inspector showing model residency, weight placement across VRAM and RAM, and the unload control](docs/model-unloaded.png)
 
 One conversation view; everything else behind a toggle.
 
@@ -246,6 +247,53 @@ One conversation view; everything else behind a toggle.
   placement, Hardware, Experts (**simulated**), Profiling, Setup
 
 Built automatically by `strata.ps1`, or by hand with `cd web && npm install && npm run build`.
+
+---
+
+## Use it with a coding agent
+
+Strata forwards `tools` to llama.cpp and starts it with `--jinja`, so the model's
+own chat template does the tool-call parsing. Any OpenAI-compatible coding agent
+can drive it — the loop below was run end to end against Ornith-1.5-35B:
+
+```
+POST /v1/chat/completions  { "tools": [...] }
+  -> finish_reason: "tool_calls", tool_calls[0].function.name = "read_file"
+POST /v1/chat/completions  { ...assistant tool_calls, then role:"tool" result }
+  -> the model reads the result and answers
+```
+
+Messages keep the fields Strata does not itself model. `tool_calls`,
+`tool_call_id` and `name` travel through untouched, and `content` is accepted as
+a string, as `null`, or as an array of content parts — the three shapes agents
+actually send.
+
+### pi
+
+For [pi](https://github.com/earendil-works/pi-mono), add the provider to
+`~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "strata": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
+      "models": [{ "id": "<your model>", "contextWindow": 65536, "maxTokens": 8192 }]
+    }
+  }
+}
+```
+
+Then `.\pi.ps1` serves the model if nothing is serving, waits for the weights,
+and opens pi on it. Closing the agent leaves the engine up so the next one starts
+instantly; `POST /model/unload` or the console's Unload button gives the memory
+back, and the next run reloads it.
+
+The same provider block works for anything that speaks OpenAI chat completions —
+point the tool at `http://127.0.0.1:8080/v1` and give it any non-empty key.
 
 ---
 
@@ -329,6 +377,53 @@ context and split are chosen and measured per machine. On 8 GB `setup` picks
 **Memory warning.** A 20 GB model plus its KV cache can push a 32 GB machine
 near its commit limit. Strata itself uses ~17 MB; the compute process is what
 grows. Lower `--ctx` or raise `--cpu-moe` if the machine gets tight.
+
+---
+
+## Questions
+
+### Will it run on my card?
+
+Hardware comes from the compute runtime's own device list, so anything that
+llama.cpp's ROCm build enumerates works — RDNA2 and RDNA3 Radeon cards including
+the RX 6700/6800/6900, RX 7600/7700/7800/7900 and gfx1102/gfx1100/gfx1200
+targets. That list needs no vendor SDK and answers the same way for Vulkan and
+CUDA builds. Development and every measurement here are on an RX 7600 XT 16 GB.
+
+### Can I run a 35B model on 16 GB of VRAM?
+
+Yes — that is the case this was built for. A 35B MoE at Q4_K runs at ~42 tok/s
+with a 65,536-token window, by keeping 15 of 41 layers' experts in host RAM
+rather than trying to fit everything on the card. Filling VRAM is the *slow*
+choice here, by more than 2×.
+
+### Do I need Ollama, LM Studio or a daemon?
+
+No. Strata starts and owns the llama.cpp process directly and exits with it.
+`pull` can copy a model out of an Ollama blob store if you already have one.
+
+### Does it work on Linux?
+
+The engine is developed and measured on Windows 11, and `strata.ps1` is
+PowerShell. The Rust code has a Linux path for memory reporting and no Windows
+API elsewhere, but nothing here has been measured on Linux — treat it as
+untested rather than supported.
+
+### Why is my GPU not being used?
+
+Run `.untime\llama-server.exe --list-devices`. A missing backend library
+shows up as an empty device list and nothing in the log, so the GPU silently
+disappears and everything falls back to CPU. Strata puts the runtime's own
+library directory and any ROCm redistributables it can find on the loader path
+before starting the process.
+
+### What happens when a conversation outgrows the window?
+
+Strata measures every request with the model's tokenizer and, past the
+threshold, replaces the middle of the conversation with a summary the model
+writes. The cut is measured from the start of the conversation so the prompt
+prefix stays stable and llama.cpp's KV cache still holds it — which is why the
+turn after a compaction costs 0.3s to first token instead of 199s.
 
 ---
 

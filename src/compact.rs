@@ -240,7 +240,7 @@ impl Compactor {
 
         let mut out: Vec<Msg> = Vec::with_capacity(head_len + 1 + messages.len() - start);
         out.extend(messages[..head_len.saturating_sub(1)].iter().cloned());
-        out.push(Msg { role: "system".into(), content: system });
+        out.push(Msg { role: "system".into(), content: system, ..Default::default() });
         out.extend(messages[start..].iter().cloned());
 
         let after: usize = self.measure(&out).await.iter().sum();
@@ -307,7 +307,7 @@ impl Compactor {
         for m in middle {
             transcript.push_str(&m.role.to_uppercase());
             transcript.push_str(":\n");
-            transcript.push_str(&m.content);
+            transcript.push_str(&m.text());
             transcript.push_str("\n\n");
         }
 
@@ -363,9 +363,9 @@ impl Compactor {
             // One tokenize call per unseen message, all in flight together.
             // After the first turn of a conversation only the newest messages
             // are unseen.
+            let texts: Vec<String> = missing.iter().map(|&i| messages[i].text()).collect();
             let fetched =
-                futures::future::join_all(missing.iter().map(|&i| self.tokenize(&messages[i].content)))
-                    .await;
+                futures::future::join_all(texts.iter().map(|t| self.tokenize(t))).await;
             let mut cache = self.counts.lock().unwrap_or_else(|e| e.into_inner());
             for (&i, n) in missing.iter().zip(fetched) {
                 out[i] = n;
@@ -501,7 +501,7 @@ fn split_marker(content: &str) -> (String, Option<String>) {
 fn digest_msg(m: &Msg) -> u64 {
     let mut h = DefaultHasher::new();
     m.role.hash(&mut h);
-    m.content.hash(&mut h);
+    m.text().hash(&mut h);
     h.finish()
 }
 
@@ -510,7 +510,7 @@ fn digest_of(prior: Option<&str>, middle: &[Msg]) -> u64 {
     prior.hash(&mut h);
     for m in middle {
         m.role.hash(&mut h);
-        m.content.hash(&mut h);
+        m.text().hash(&mut h);
     }
     h.finish()
 }
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> Msg {
-        Msg { role: role.into(), content: content.into() }
+        Msg { role: role.into(), content: content.into(), ..Default::default() }
     }
 
     #[test]
