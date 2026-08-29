@@ -74,11 +74,26 @@ than assuming the GPU is being used.
 
 ### 3. Get a model
 
-Any MoE `.gguf` at `rocm/models/<name>/model.gguf`, or:
+Any MoE `.gguf` at `rocm/models/<name>/model.gguf`, or fetch one:
 
 ```powershell
-.\target\release\strata.exe pull --model <name>   # from a local Ollama blob store
+.\target\release\strata.exe pull --model ornith-1.5:35b   # from Ollama
+.\target\release\strata.exe pull --model owner/repo       # from Hugging Face
 ```
+
+`pull` takes an Ollama model, resolved through Ollama's own manifests, or a
+Hugging Face repository named in full. When a repository holds several
+quantisations it lists them rather than choosing one:
+
+```
+TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF holds 12 GGUF files. Name one:
+  tinyllama-1.1b-chat-v1.0.Q2_K.gguf
+  ...
+  strata pull --model TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF:<file>
+```
+
+The model lands at `rocm/models/<name>/model.gguf` under the name of the file
+you picked, and `strata list` reads it back from its header.
 
 ### 4. Configure and serve
 
@@ -307,7 +322,7 @@ point the tool at `http://127.0.0.1:8080/v1` and give it any non-empty key.
 | `inspect --path <gguf>` | everything a model file declares about itself |
 | `plan --model <m> [--ctx] [--vram] [--ram]` | where the weights would sit |
 | `tune --model <m> [--ctx] [--kv-type T] [--save]` | measure the fastest split on this machine |
-| `pull --model <m>` | copy a model out of a local Ollama blob store |
+| `pull --model <m>` | fetch a model: an Ollama name, or `owner/repo[:file.gguf]` from Hugging Face |
 | `serve --model <m> [--ctx] [--cpu-moe N] [--no-compact] [--kv-type T] [--api-key K]` | load and serve |
 
 Tuning results are stored per context as `tuned-<ctx>.json`, because the KV
@@ -411,7 +426,8 @@ untested rather than supported.
 
 ### Why is my GPU not being used?
 
-Run `.untime\llama-server.exe --list-devices`. A missing backend library
+Run `.
+untime\llama-server.exe --list-devices`. A missing backend library
 shows up as an empty device list and nothing in the log, so the GPU silently
 disappears and everything falls back to CPU. Strata puts the runtime's own
 library directory and any ROCm redistributables it can find on the loader path
