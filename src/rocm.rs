@@ -39,13 +39,29 @@ fn vendored_hip_sdk() -> PathBuf {
     }
     PathBuf::from("rocm/hip-sdk")
 }
-fn vendored_detect() -> PathBuf {
-    let cands = [
+
+/// A script that prints this machine's gfx target, named by `STRATA_GPU_DETECT`.
+///
+/// Opportunistic, like the SDK above. The script this was written against ships
+/// with ComfyUI and is not part of this repository, so on a fresh clone there is
+/// nothing to find, `info` prints no gfx line, and everything else is unaffected
+/// - the runtime's own device list is what planning and serving actually use.
+///
+/// `rocm/detect_gpu.py` is still honoured when it happens to be there, so a
+/// checkout that has one keeps working without being configured.
+fn gfx_detect_script() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("STRATA_GPU_DETECT") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    [
         PathBuf::from("rocm/detect_gpu.py"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rocm").join("detect_gpu.py"),
-    ];
-    for c in cands { if c.exists() { return c; } }
-    PathBuf::from("rocm/detect_gpu.py")
+    ]
+    .into_iter()
+    .find(|c| c.exists())
 }
 
 fn local_hip_path() -> PathBuf {
@@ -105,14 +121,10 @@ pub fn detect() -> Result<RocmInfo> {
         None => (None, None, None),
     };
 
-    // 3. The gfx target, from the vendored detector when a Python exists to run
-    //    it. Left unknown rather than guessed.
-    let gfx = py.as_ref().and_then(|py| {
-        let detect_path = vendored_detect();
-        if !detect_path.exists() {
-            return None;
-        }
-        let o = std::process::Command::new(py).arg(&detect_path).output().ok()?;
+    // 3. The gfx target, when this machine has both a Python and a script for
+    //    it to run. Left unknown rather than guessed.
+    let gfx = py.as_ref().zip(gfx_detect_script()).and_then(|(py, script)| {
+        let o = std::process::Command::new(py).arg(&script).output().ok()?;
         let text = String::from_utf8(o.stdout).ok()?;
         let t = text.trim().to_string();
         t.starts_with("gfx").then_some(t)
