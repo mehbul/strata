@@ -1235,6 +1235,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         profile: Mutex::new(Vec::new()),
         experts: Mutex::new(Experts::new(layers, n_experts, top_k, vram_frac, ram_frac)),
     });
+    // Kept out of the router so the compute process can still be stopped after
+    // the server has finished shutting down.
+    let shutdown_state = state.clone();
 
 
     let api = Router::new()
@@ -1273,10 +1276,61 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    axum::serve(listener, app).await?;
-    // The router owns the only remaining handle to the state, so returning here
-    // drops it, which drops `Compute`, which kills the compute process.
+
+    // Ctrl+C and the window's close button terminate the process without
+    // running a destructor, so the compute process outlives the server that
+    // started it - still holding the weights, and still holding port 8099, so
+    // the next start cannot spawn its own. Waiting for the signal here is what
+    // gives `Compute` the chance to be dropped on the way out.
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_for_server = stop.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { stop_for_server.notified().await })
+            .await
+    });
+
+    wait_for_signal().await;
+    println!();
+    println!("stopping...");
+    // `notify_one`, not `notify_waiters`: it leaves a permit, so the signal is
+    // not lost if it arrives before the server task has registered.
+    stop.notify_one();
+    // In-flight turns get a moment to finish and no longer. A streaming
+    // response can outlast any patience, and Windows allows only about five
+    // seconds after a console close before it kills the process itself.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+    if let Some(compute) = &shutdown_state.compute {
+        if compute.lock().await.unload() {
+            println!("  compute process stopped, VRAM released");
+        }
+    }
     Ok(())
+}
+
+/// Ctrl+C, and on Windows the console's close button, a shutdown and a logoff.
+///
+/// Closing the window is not Ctrl+C and arrives as its own event. It is also
+/// the way this server is most often stopped, so handling only Ctrl+C would
+/// leave the common case exactly as broken as it was.
+async fn wait_for_signal() {
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        // Registration only fails where there is no console to signal us, and
+        // plain Ctrl+C is still worth waiting on if it does.
+        if let (Ok(mut interrupt), Ok(mut close), Ok(mut shutdown)) =
+            (windows::ctrl_c(), windows::ctrl_close(), windows::ctrl_shutdown())
+        {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = close.recv() => {}
+                _ = shutdown.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]
