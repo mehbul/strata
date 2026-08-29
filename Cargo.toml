@@ -1,0 +1,33 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2021"
+description = "ROCm-native MoE inference engine with tiered VRAM/RAM/NVMe weight placement"
+authors = ["Mehbul Islam"]
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memmap2 = "0.9"
+safetensors = "0.4"
+axum = { version = "0.7", features = ["json", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+libloading = "0.8"
+bytemuck = "1"
+futures = "0.3.34"
+
+[features]
+default = []
+rocm = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

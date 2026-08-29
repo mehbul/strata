@@ -1,0 +1,25 @@
+# Rust build output
+/target
+
+# Vendored llama.cpp runtime (~1.3 GB) — fetched, not authored.
+# `strata serve` finds it here; see README for the download.
+/runtime
+
+# Model weights and anything derived from them
+/rocm/models
+*.gguf
+tuned.json
+
+# Vendored ROCm SDK and caches
+/rocm/hip-sdk
+/rocm/triton-cache
+/rocm/tunableop-cache
+
+# Web
+/web/node_modules
+/web/dist
+/web/*.tsbuildinfo
+
+# Local state
+.strata_usage*
+.strata_kv*
