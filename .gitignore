@@ -5,15 +5,11 @@
 # `strata serve` finds it here; see README for the download.
 /runtime
 
-# Model weights and anything derived from them
-/rocm/models
+# Everything under rocm/ is local to one machine: model weights and their
+# measurements, a vendored ROCm SDK, its caches, and whatever GPU-detection
+# script that machine happens to have. None of it is authored here.
+/rocm/
 *.gguf
-tuned.json
-
-# Vendored ROCm SDK and caches
-/rocm/hip-sdk
-/rocm/triton-cache
-/rocm/tunableop-cache
 
 # Web
 /web/node_modules
