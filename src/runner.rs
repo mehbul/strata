@@ -148,6 +148,20 @@ impl Flags {
             "-t".into(),
             self.threads.to_string(),
             "--no-webui".into(),
+            // One slot, not the four this build picks on its own.
+            //
+            // With `-np auto` the KV cache is a single unified pool of `-c`
+            // cells shared by every slot, so four slots do not buy four
+            // conversations - they share one conversation's worth of cells and
+            // a turn can land on a slot that does not hold the prefix. The
+            // prompt cache then tries to restore the saved state into a pool
+            // the live conversation already occupies, fails to find the cells,
+            // and reprocesses the whole prompt: "failed to find N available
+            // cells in kv cache". One slot is also what the context budget here
+            // already assumes, and it costs no memory - the pool is sized by
+            // `-c` either way.
+            "-np".into(),
+            "1".into(),
             // Render the model's own chat template. Without it llama.cpp
             // refuses any request carrying `tools` - "tools param requires
             // --jinja flag" - so a coding agent cannot talk to Strata at all,
@@ -364,6 +378,7 @@ mod tests {
                 "-ngl", "99",
                 "-t", "6",
                 "--no-webui",
+                "-np", "1",
                 "--jinja",
                 "-ncmoe", "15",
                 "-fa", "on",
