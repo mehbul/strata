@@ -332,6 +332,21 @@ grows. Lower `--ctx` or raise `--cpu-moe` if the machine gets tight.
 
 ---
 
+## Notes
+
+Longer documents behind the decisions above:
+
+- [Engine notes](docs/LEARNING.md) — the model these choices were measured
+  against, why placement and tuning work the way they do, and what is intended
+  but not built.
+- [Design](docs/DESIGN.md) — the console's visual system, recorded from the
+  built interface: tokens, structure, motion, and the rules that keep it honest
+  about what the engine does not do yet.
+- [Product](docs/PRODUCT.md) — who this is for, what works today, and what
+  belongs to llama.cpp rather than to Strata.
+
+---
+
 ## Roadmap
 
 Making the math Strata's own, in order, each step verifiable against the current
