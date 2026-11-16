@@ -24,18 +24,29 @@ fn comfy_python() -> Option<PathBuf> {
     // interpreter is three levels up, not four - which is what this walked
     // before, landing on a path that has never existed and sending every
     // detection down the fallback branch.
-    let py = comfy_rocm_sdk()?.join("..").join("..").join("..").join("python.exe");
+    let py = comfy_rocm_sdk()?
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("python.exe");
     py.exists().then_some(py)
 }
 fn vendored_hip_sdk() -> PathBuf {
     // Relative to exe or cwd, not hardcoded absolute with username
     let candidates = [
         PathBuf::from("rocm/hip-sdk"),
-        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("../../rocm/hip-sdk"))).unwrap_or_default(),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rocm").join("hip-sdk"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.join("../../rocm/hip-sdk")))
+            .unwrap_or_default(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rocm")
+            .join("hip-sdk"),
     ];
     for c in candidates {
-        if c.join("bin").join("amdhip64_7.dll").exists() { return c; }
+        if c.join("bin").join("amdhip64_7.dll").exists() {
+            return c;
+        }
     }
     PathBuf::from("rocm/hip-sdk")
 }
@@ -58,7 +69,9 @@ fn gfx_detect_script() -> Option<PathBuf> {
     }
     [
         PathBuf::from("rocm/detect_gpu.py"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rocm").join("detect_gpu.py"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rocm")
+            .join("detect_gpu.py"),
     ]
     .into_iter()
     .find(|c| c.exists())
@@ -95,7 +108,10 @@ pub fn detect() -> Result<RocmInfo> {
     let hip_path = local_hip_path();
     let amdhip = hip_path.join("bin").join("amdhip64_7.dll");
     if !amdhip.exists() {
-        anyhow::bail!("amdhip64_7.dll not found at {:?} (checked vendored + comfy)", amdhip);
+        anyhow::bail!(
+            "amdhip64_7.dll not found at {:?} (checked vendored + comfy)",
+            amdhip
+        );
     }
 
     // 2. A ComfyUI PyTorch, if this machine happens to have one, gives the
@@ -123,26 +139,39 @@ pub fn detect() -> Result<RocmInfo> {
 
     // 3. The gfx target, when this machine has both a Python and a script for
     //    it to run. Left unknown rather than guessed.
-    let gfx = py.as_ref().zip(gfx_detect_script()).and_then(|(py, script)| {
-        let o = std::process::Command::new(py).arg(&script).output().ok()?;
-        let text = String::from_utf8(o.stdout).ok()?;
-        let t = text.trim().to_string();
-        t.starts_with("gfx").then_some(t)
-    });
+    let gfx = py
+        .as_ref()
+        .zip(gfx_detect_script())
+        .and_then(|(py, script)| {
+            let o = std::process::Command::new(py).arg(&script).output().ok()?;
+            let text = String::from_utf8(o.stdout).ok()?;
+            let t = text.trim().to_string();
+            t.starts_with("gfx").then_some(t)
+        });
 
- // 4. Try to validate amdhip64_7.dll
+    // 4. Try to validate amdhip64_7.dll
     // On Windows this DLL has deps in same bin dir - need to add to PATH for LoadLibraryEx
     // We check existence + torch HIP already proved runtime works (torch.cuda.is_available() == true)
     // So we soft-check: try load, but don't fail if deps missing - torch is the ground truth
     let hip_bin = hip_path.join("bin");
+    // `libloading::os::windows` only exists on Windows. Guarding it is what lets
+    // the crate build on Linux, where CI compiles it even though ROCm detection
+    // itself is Windows-only.
+    #[cfg(windows)]
     unsafe {
         // Add hip bin to DLL search path for this process (like comfyui-rocm.bat does via PATH)
-        let _ = libloading::os::windows::Library::new(&amdhip).map(|_| ()).or_else(|e| {
-            // fallback: check existence only, rely on torch HIP check
-            if amdhip.exists() { Ok(()) } else { Err(e) }
-        });
-        let _ = hip_bin; // keep for future explicit loader
+        let _ = libloading::os::windows::Library::new(&amdhip)
+            .map(|_| ())
+            .or_else(|e| {
+                // fallback: check existence only, rely on torch HIP check
+                if amdhip.exists() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            });
     }
+    let _ = hip_bin; // keep for future explicit loader
 
     Ok(RocmInfo {
         hip_path,
@@ -200,11 +229,17 @@ pub fn print_info() -> Result<()> {
     // machine that has none. Nothing here is required to serve a model.
     match detect() {
         Ok(info) => {
-            let kb = std::fs::metadata(&info.amdhip_dll).map(|m| m.len() / 1024).ok();
+            let kb = std::fs::metadata(&info.amdhip_dll)
+                .map(|m| m.len() / 1024)
+                .ok();
             println!(
                 "HIP SDK        : {} ({})",
                 info.hip_path.display(),
-                if is_vendored() { "vendored" } else { "external" }
+                if is_vendored() {
+                    "vendored"
+                } else {
+                    "external"
+                }
             );
             match kb {
                 Some(kb) => println!("amdhip64_7.dll : {} ({kb} KB)", info.amdhip_dll.display()),
@@ -255,7 +290,10 @@ pub fn vram_total_gb() -> f32 {
     // A ComfyUI PyTorch, where one exists, as a second opinion.
     if let Some(py) = comfy_python() {
         let out = std::process::Command::new(&py)
-            .args(["-c", "import torch;print(torch.cuda.get_device_properties(0).total_memory)"])
+            .args([
+                "-c",
+                "import torch;print(torch.cuda.get_device_properties(0).total_memory)",
+            ])
             .output();
         if let Ok(o) = out {
             if o.status.success() {

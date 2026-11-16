@@ -20,7 +20,9 @@ pub struct ModelEntry {
 /// Scan `root` (typically `rocm/models`) for `<name>/model.gguf` and read facts.
 pub fn scan(root: &Path) -> Vec<ModelEntry> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else { return out; };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
     for e in rd.flatten() {
         let dir = e.path();
         if !dir.is_dir() {
@@ -114,15 +116,18 @@ pub fn default_root() -> PathBuf {
 pub async fn switch(url: &str, model: &str, api_key: Option<&str>) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let endpoint = format!("{}/api/models/load", url.trim_end_matches('/'));
-    let mut req = client.post(&endpoint).json(&serde_json::json!({ "model": model }));
+    let mut req = client
+        .post(&endpoint)
+        .json(&serde_json::json!({ "model": model }));
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
         req = req.bearer_auth(key);
     }
 
     println!("Switching {url} to {model}");
-    let resp = req.send().await.map_err(|e| {
-        anyhow::anyhow!("could not reach {url}: {e} (is `strata serve` running?)")
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not reach {url}: {e} (is `strata serve` running?)"))?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 

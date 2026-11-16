@@ -193,7 +193,9 @@ pub async fn run(
             ),
         },
     };
-    let Some(path) = resolve_path(&model) else { bail!("no model file for '{model}'") };
+    let Some(path) = resolve_path(&model) else {
+        bail!("no model file for '{model}'")
+    };
 
     let choice = plan_for(&path, &machine)?;
     println!("\n  model     {}", path.display());
@@ -203,7 +205,10 @@ pub async fn run(
         choice.kv_gb,
         100.0 * choice.kv_gb / choice.vram_gb
     );
-    println!("  resident  {:.2} GB of dense weights before any expert", choice.dense_gb);
+    println!(
+        "  resident  {:.2} GB of dense weights before any expert",
+        choice.dense_gb
+    );
     println!(
         "  ceiling   {:.0} GB of weights fit without touching disk ({:.0} GB VRAM + {:.0} GB free RAM)",
         choice.ceiling_gb, choice.vram_gb, choice.ram_gb
@@ -277,7 +282,10 @@ fn sole_local_model() -> Result<Option<String>> {
     match found.len() {
         0 => Ok(None),
         1 => Ok(Some(found.remove(0))),
-        _ => bail!("several models present; choose one with --model: {}", found.join(", ")),
+        _ => bail!(
+            "several models present; choose one with --model: {}",
+            found.join(", ")
+        ),
     }
 }
 

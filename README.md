@@ -1,20 +1,44 @@
 # Strata
 
-**A local inference engine for mixture-of-experts models on AMD GPUs, written in Rust.**
+**Run 35B mixture-of-experts models on a 16 GB AMD Radeon card. No Ollama, no daemon.**
 
+[![CI](https://github.com/mehbul/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/mehbul/strata/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
 [![GPU](https://img.shields.io/badge/GPU-ROCm%20%7C%20Vulkan%20%7C%20CUDA-red.svg)]()
 
-Strata runs large **MoE GGUF models on consumer AMD Radeon cards** — ROCm on
-Windows, no Ollama and no daemon. It reads the model file itself, works out where
-its weights should sit across VRAM and system RAM, starts and owns the
-llama.cpp compute process, and serves an OpenAI-compatible API plus a web
-console. It configures itself for whatever machine it lands on.
+![Strata reading a GGUF and benchmarking a model it is serving](docs/demo.gif)
 
-**35B MoE at ~42 tok/s on a 16 GB card, with a 65,536-token window.** No daemon,
-no Ollama.
+Strata reads the model file itself, works out where its weights should sit across
+VRAM and system RAM, starts and owns the llama.cpp compute process, and serves an
+OpenAI-compatible API plus a web console. It configures itself for whatever
+machine it lands on.
+
+**35B MoE at ~42 tok/s on a 16 GB card, with a 65,536-token window.**
+
+## Install
+
+```powershell
+irm https://raw.githubusercontent.com/mehbul/strata/main/install.ps1 | iex
+```
+
+That checks for git and Rust, fetches the llama.cpp ROCm runtime, builds the
+release binary, and configures the machine. It does not download a model — those
+are large and the choice is yours. [Read what it does](install.ps1) before piping
+it to `iex`; that is good practice for any script you run this way.
+
+Then fetch a model and serve:
+
+```powershell
+.\target\release\strata.exe pull --model ornith-1.5:35b
+.\strata.ps1
+```
+
+> **No hosted demo.** Strata is a local engine that owns your GPU, so there is
+> nothing to click: a live demo would mean handing a stranger a Radeon card.
+> The GIF above is a real session on the RX 7600 XT, and the numbers in it are
+> the ones `strata bench` printed.
 
 ![Strata's web console streaming from a 35B MoE model on a Radeon RX 7600 XT](docs/console.jpg)
 

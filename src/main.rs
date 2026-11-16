@@ -1,19 +1,19 @@
 //! Strata — a local inference engine for mixture-of-experts models on ROCm.
 
-mod compact;
-mod bench;
-mod hardware;
 mod backend;
-mod mcp;
+mod bench;
+mod compact;
 mod expert;
 mod gguf;
+mod hardware;
 mod hub;
+mod mcp;
 mod placement;
 mod registry;
 mod rocm;
 mod runner;
-mod setup;
 mod server;
+mod setup;
 mod tune;
 
 use anyhow::Result;
@@ -21,7 +21,11 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "strata", version, about = "Strata - local MoE inference engine (ROCm)")]
+#[command(
+    name = "strata",
+    version,
+    about = "Strata - local MoE inference engine (ROCm)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -159,7 +163,7 @@ enum Commands {
         output_tokens: usize,
         #[arg(long)]
         json: Option<String>,
-}
+    },
 }
 
 #[tokio::main]
@@ -168,9 +172,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match Cli::parse().command {
-        Commands::Setup { model, force, dry_run, allow_disk } => {
-            setup::run(model, force, dry_run, allow_disk).await?
-        }
+        Commands::Setup {
+            model,
+            force,
+            dry_run,
+            allow_disk,
+        } => setup::run(model, force, dry_run, allow_disk).await?,
         Commands::Info => rocm::print_info()?,
         Commands::List => placement::list_local()?,
         Commands::Models => {
@@ -188,22 +195,40 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Commands::Switch { url, model, api_key } => {
+        Commands::Switch {
+            url,
+            model,
+            api_key,
+        } => {
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             registry::switch(&url, &model, api_key.as_deref()).await?
         }
         Commands::Inspect { path } => gguf::inspect(&path)?,
-        Commands::Plan { model, ctx, vram, ram } => {
+        Commands::Plan {
+            model,
+            ctx,
+            vram,
+            ram,
+        } => {
             let vram = vram.unwrap_or_else(rocm::vram_total_gb);
             placement::report(&model, ctx, vram, ram)?
         }
         Commands::Pull { model } => {
             hub::Hub::new().pull(&model).await?;
         }
-        Commands::Tune { model, ctx, kv_type, save } => {
-            tune::run(&model, ctx, kv_type, save).await?
-        }
-        Commands::Bench { url, model, prompt_tokens, output_tokens, json } => {
+        Commands::Tune {
+            model,
+            ctx,
+            kv_type,
+            save,
+        } => tune::run(&model, ctx, kv_type, save).await?,
+        Commands::Bench {
+            url,
+            model,
+            prompt_tokens,
+            output_tokens,
+            json,
+        } => {
             bench::run(bench::BenchArgs {
                 url,
                 model,
@@ -213,10 +238,23 @@ async fn main() -> Result<()> {
             })
             .await?
         }
-        Commands::Mcp => {
-            mcp::run().await?
-        }
-        Commands::Serve { listen, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key, draft, spec, mmproj, devices, tensor_split, backend } => {
+        Commands::Mcp => mcp::run().await?,
+        Commands::Serve {
+            listen,
+            model,
+            ctx,
+            cpu_moe,
+            upstream,
+            no_compact,
+            kv_type,
+            api_key,
+            draft,
+            spec,
+            mmproj,
+            devices,
+            tensor_split,
+            backend,
+        } => {
             server::serve(server::ServeOptions {
                 listen,
                 model,
@@ -240,4 +278,3 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-

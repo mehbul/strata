@@ -23,5 +23,9 @@ fn main() {
 /// other one, which stays invisible until someone else's build quietly takes
 /// the other branch.
 fn comfy_hipcc() -> Option<std::path::PathBuf> {
-    Some(std::path::Path::new(&std::env::var("COMFY_ROCM_SDK").ok()?).join("bin").join("hipcc.exe"))
+    Some(
+        std::path::Path::new(&std::env::var("COMFY_ROCM_SDK").ok()?)
+            .join("bin")
+            .join("hipcc.exe"),
+    )
 }

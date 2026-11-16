@@ -17,7 +17,9 @@ pub struct Hub {
 
 impl Hub {
     pub fn new() -> Self {
-        Self { cache_dir: PathBuf::from("rocm/models") }
+        Self {
+            cache_dir: PathBuf::from("rocm/models"),
+        }
     }
 
     /// `strata pull --model <name>`.
@@ -35,7 +37,11 @@ impl Hub {
         //    decided by reading the header, not by file size: that is true of a
         //    500 MB model and false of a truncated 30 GB download.
         if is_gguf(&dest) {
-            println!("hub: {model} is already at {} ({:.1} GB)", dest.display(), file_gb(&dest));
+            println!(
+                "hub: {model} is already at {} ({:.1} GB)",
+                dest.display(),
+                file_gb(&dest)
+            );
             return Ok(out);
         }
 
@@ -83,12 +89,22 @@ impl Hub {
         };
 
         std::fs::create_dir_all(&out)?;
-        println!("hub: pulling https://huggingface.co/{repo} -> {}", dest.display());
+        println!(
+            "hub: pulling https://huggingface.co/{repo} -> {}",
+            dest.display()
+        );
         self.download(&client, repo, &file, &dest).await?;
         if !is_gguf(&dest) {
-            bail!("{} downloaded but does not start with the GGUF magic", dest.display());
+            bail!(
+                "{} downloaded but does not start with the GGUF magic",
+                dest.display()
+            );
         }
-        println!("hub: {model} ready at {} ({:.1} GB)", dest.display(), file_gb(&dest));
+        println!(
+            "hub: {model} ready at {} ({:.1} GB)",
+            dest.display(),
+            file_gb(&dest)
+        );
         Ok(out)
     }
 
@@ -104,7 +120,9 @@ impl Hub {
         let name = match hf_ref(model) {
             Some((_, Some(file))) => {
                 let base = file.rsplit('/').next().unwrap_or(file);
-                base.strip_suffix(".gguf").or_else(|| base.strip_suffix(".GGUF")).unwrap_or(base)
+                base.strip_suffix(".gguf")
+                    .or_else(|| base.strip_suffix(".GGUF"))
+                    .unwrap_or(base)
             }
             Some((repo, None)) => repo.rsplit('/').next().unwrap_or(repo),
             None => model,
@@ -153,7 +171,10 @@ impl Hub {
 
         let total = res.content_length().unwrap_or(0) + if append { resume_from } else { 0 };
         let mut file = if append {
-            tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&partial)
+                .await?
         } else {
             tokio::fs::File::create(&partial).await?
         };
@@ -185,7 +206,11 @@ impl Hub {
 /// The `.gguf` files a Hugging Face repository lists.
 async fn gguf_files(client: &reqwest::Client, repo: &str) -> Result<Vec<String>> {
     let url = format!("https://huggingface.co/api/models/{repo}");
-    let res = client.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     if !res.status().is_success() {
         bail!("huggingface.co/{repo} -> {}", res.status());
     }
@@ -228,7 +253,9 @@ fn file_gb(path: &Path) -> f32 {
 /// download.
 fn is_gguf(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).is_ok() && &magic == b"GGUF"
 }
@@ -238,7 +265,9 @@ fn ollama_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("OLLAMA_MODELS") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
     Some(PathBuf::from(home).join(".ollama").join("models"))
 }
 
@@ -283,14 +312,21 @@ fn ollama_blob_in(root: &Path, model: &str) -> Option<PathBuf> {
 /// several tags and none asked for is ambiguous, and answering it by picking
 /// one is how the wrong weights arrive under the right name.
 fn find_manifest(dir: &Path, name: &str, tag: Option<&str>) -> Option<PathBuf> {
-    let entries: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    let entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     let here = dir.file_name()?.to_string_lossy().to_lowercase();
 
     if here == name || name.ends_with(&format!("/{here}")) {
         let tags: Vec<&PathBuf> = entries.iter().filter(|p| p.is_file()).collect();
         let named = |t: &str| {
             tags.iter()
-                .find(|p| p.file_name().is_some_and(|f| f.to_string_lossy().to_lowercase() == t))
+                .find(|p| {
+                    p.file_name()
+                        .is_some_and(|f| f.to_string_lossy().to_lowercase() == t)
+                })
                 .map(|p| (*p).clone())
         };
         if let Some(t) = tag {
@@ -304,7 +340,10 @@ fn find_manifest(dir: &Path, name: &str, tag: Option<&str>) -> Option<PathBuf> {
         }
     }
 
-    entries.iter().filter(|p| p.is_dir()).find_map(|sub| find_manifest(sub, name, tag))
+    entries
+        .iter()
+        .filter(|p| p.is_dir())
+        .find_map(|sub| find_manifest(sub, name, tag))
 }
 
 #[cfg(test)]
@@ -315,7 +354,10 @@ mod tests {
     fn store(tag: &str, models: &[(&str, &str, &str)]) -> PathBuf {
         let root = std::env::temp_dir().join(format!("strata-hub-{tag}"));
         let _ = std::fs::remove_dir_all(&root);
-        let lib = root.join("manifests").join("registry.ollama.ai").join("library");
+        let lib = root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library");
         std::fs::create_dir_all(root.join("blobs")).unwrap();
         for (name, tag, digest) in models {
             std::fs::create_dir_all(lib.join(name)).unwrap();
@@ -327,7 +369,11 @@ mod tests {
             );
             std::fs::write(lib.join(name).join(tag), manifest).unwrap();
             std::fs::write(root.join("blobs").join(format!("sha256-{digest}")), b"GGUF").unwrap();
-            std::fs::write(root.join("blobs").join(format!("sha256-{digest}pro")), b"GGUF").unwrap();
+            std::fs::write(
+                root.join("blobs").join(format!("sha256-{digest}pro")),
+                b"GGUF",
+            )
+            .unwrap();
         }
         root
     }
@@ -352,10 +398,15 @@ mod tests {
     /// The bug this replaced: whichever blob was biggest answered every pull.
     #[test]
     fn each_model_resolves_to_its_own_blob() {
-        let root = store("two", &[("small-one", "3b", "aaa"), ("big-one", "70b", "bbb")]);
+        let root = store(
+            "two",
+            &[("small-one", "3b", "aaa"), ("big-one", "70b", "bbb")],
+        );
         let small = ollama_blob_in(&root, "small-one:3b").unwrap();
         assert!(small.ends_with("sha256-aaa"), "{}", small.display());
-        assert!(ollama_blob_in(&root, "big-one:70b").unwrap().ends_with("sha256-bbb"));
+        assert!(ollama_blob_in(&root, "big-one:70b")
+            .unwrap()
+            .ends_with("sha256-bbb"));
         assert!(ollama_blob_in(&root, "not-here:1b").is_none());
         assert!(ollama_blob_in(&root, "small-one:70b").is_none());
         let _ = std::fs::remove_dir_all(&root);
@@ -364,7 +415,9 @@ mod tests {
     #[test]
     fn a_single_tag_answers_a_name_with_no_tag() {
         let root = store("one", &[("only-one", "35b", "ccc")]);
-        assert!(ollama_blob_in(&root, "only-one").unwrap().ends_with("sha256-ccc"));
+        assert!(ollama_blob_in(&root, "only-one")
+            .unwrap()
+            .ends_with("sha256-ccc"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -372,7 +425,9 @@ mod tests {
     fn a_pulled_model_gets_a_name_worth_typing() {
         // The whole reference makes a directory no one would type after --model.
         assert_eq!(
-            Hub::dir_name("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF:tinyllama-1.1b-chat-v1.0.Q2_K.gguf"),
+            Hub::dir_name(
+                "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF:tinyllama-1.1b-chat-v1.0.Q2_K.gguf"
+            ),
             "tinyllama-1.1b-chat-v1.0.Q2_K"
         );
         // Two quants of one repository are two models, not one.
@@ -387,7 +442,10 @@ mod tests {
     #[test]
     fn a_hugging_face_reference_needs_a_slash() {
         assert_eq!(hf_ref("owner/repo"), Some(("owner/repo", None)));
-        assert_eq!(hf_ref("owner/repo:file.gguf"), Some(("owner/repo", Some("file.gguf"))));
+        assert_eq!(
+            hf_ref("owner/repo:file.gguf"),
+            Some(("owner/repo", Some("file.gguf")))
+        );
         // An Ollama name:tag is not a repository, and must never be sent as one.
         assert_eq!(hf_ref("ornith-1.5:35b"), None);
         assert_eq!(hf_ref("ornith-1.5_35b"), None);

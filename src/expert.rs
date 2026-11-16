@@ -25,16 +25,21 @@ impl ExpertPlan {
     /// What `-ncmoe n` means: the first `n` layers.
     pub fn first_n(n: usize, total_layers: usize) -> Self {
         let n = n.min(total_layers);
-        Self { cpu_layers: (0..n).collect(), total_layers }
+        Self {
+            cpu_layers: (0..n).collect(),
+            total_layers,
+        }
     }
 
     /// An arbitrary set of layers. Order and duplicates do not matter.
     pub fn from_layers(layers: impl IntoIterator<Item = usize>, total_layers: usize) -> Self {
-        let mut cpu_layers: Vec<usize> =
-            layers.into_iter().filter(|&l| l < total_layers).collect();
+        let mut cpu_layers: Vec<usize> = layers.into_iter().filter(|&l| l < total_layers).collect();
         cpu_layers.sort_unstable();
         cpu_layers.dedup();
-        Self { cpu_layers, total_layers }
+        Self {
+            cpu_layers,
+            total_layers,
+        }
     }
 
     pub fn cpu_layers(&self) -> &[usize] {
@@ -96,7 +101,10 @@ mod tests {
     fn a_gap_makes_it_a_pattern() {
         let plan = ExpertPlan::from_layers([0, 1, 5], 41);
         assert_eq!(plan.as_first_n(), None);
-        assert_eq!(plan.to_override().unwrap(), r"blk\.(0|1|5)\.ffn_.*_exps\.=CPU");
+        assert_eq!(
+            plan.to_override().unwrap(),
+            r"blk\.(0|1|5)\.ffn_.*_exps\.=CPU"
+        );
     }
 
     #[test]

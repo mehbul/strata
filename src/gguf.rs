@@ -249,7 +249,10 @@ impl Gguf {
         let path = path.as_ref();
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let file_size = file.metadata()?.len();
-        let mut cur = Cursor { inner: BufReader::with_capacity(1 << 20, file), pos: 0 };
+        let mut cur = Cursor {
+            inner: BufReader::with_capacity(1 << 20, file),
+            pos: 0,
+        };
 
         let magic = cur.take::<4>()?;
         if &magic != MAGIC {
@@ -283,7 +286,12 @@ impl Gguf {
             }
             let kind = GgmlType::from_id(cur.u32()?);
             let offset = cur.u64()?;
-            tensors.push(TensorInfo { name, dims, kind, offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                kind,
+                offset,
+            });
         }
 
         // Tensor data begins at the next alignment boundary after the index.
@@ -294,7 +302,13 @@ impl Gguf {
         let data_offset = cur.pos.div_ceil(alignment) * alignment;
         cur.inner.seek(SeekFrom::Start(data_offset))?;
 
-        Ok(Self { version, metadata, tensors, data_offset, file_size })
+        Ok(Self {
+            version,
+            metadata,
+            tensors,
+            data_offset,
+            file_size,
+        })
     }
 
     pub fn arch(&self) -> &str {
@@ -305,7 +319,10 @@ impl Gguf {
     }
 
     pub fn name(&self) -> &str {
-        self.metadata.get("general.name").and_then(|v| v.as_str()).unwrap_or("unnamed")
+        self.metadata
+            .get("general.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed")
     }
 
     /// Architecture-scoped metadata lookup, e.g. `key("block_count")`.
@@ -346,7 +363,10 @@ impl Gguf {
     /// The per-layer prefix set, e.g. everything under `blk.0.`.
     pub fn layer_tensors(&self, layer: usize) -> Vec<&TensorInfo> {
         let prefix = format!("blk.{layer}.");
-        self.tensors.iter().filter(|t| t.name.starts_with(&prefix)).collect()
+        self.tensors
+            .iter()
+            .filter(|t| t.name.starts_with(&prefix))
+            .collect()
     }
 }
 
@@ -420,11 +440,17 @@ pub fn inspect(path: &str) -> Result<()> {
     println!("file          : {} ({:.2} GiB)", path, gb(facts.file_bytes));
     println!("gguf version  : {}", gguf.version);
     println!("architecture  : {}", facts.arch);
-    println!("tensors       : {}  (data starts at byte {})", facts.tensor_count, gguf.data_offset);
+    println!(
+        "tensors       : {}  (data starts at byte {})",
+        facts.tensor_count, gguf.data_offset
+    );
     println!();
     println!("layers        : {}", facts.layers);
     println!("embedding     : {}", facts.embedding);
-    println!("attn heads    : {} query / {} kv", facts.heads, facts.kv_heads);
+    println!(
+        "attn heads    : {} query / {} kv",
+        facts.heads, facts.kv_heads
+    );
     if facts.is_moe() {
         println!(
             "experts       : {} per layer, top-{} routed, ff {}",
@@ -448,11 +474,21 @@ pub fn inspect(path: &str) -> Result<()> {
     for (kind, count, bytes) in gguf.by_type() {
         println!("  {kind:<6} {count:>5} tensors  {:>8.2} GiB", gb(bytes));
     }
-    println!("  {:<6} {:>5} tensors  {:>8.2} GiB total", "", facts.tensor_count, gb(gguf.tensor_bytes()));
+    println!(
+        "  {:<6} {:>5} tensors  {:>8.2} GiB total",
+        "",
+        facts.tensor_count,
+        gb(gguf.tensor_bytes())
+    );
 
     println!("\n--- layer 0 ---");
     for t in gguf.layer_tensors(0) {
-        let dims = t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" x ");
+        let dims = t
+            .dims
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(" x ");
         println!("  {:<34} {:<20} {}", t.name, dims, t.kind.name());
     }
     Ok(())

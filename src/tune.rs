@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use crate::placement::{resolve_path, Placement};
 use crate::runner::{Flags, Runner};
 
-const PROMPT: &str = "Write a Rust function that parses a GGUF header and returns the tensor count. Code only.";
+const PROMPT: &str =
+    "Write a Rust function that parses a GGUF header and returns the tensor count. Code only.";
 const TOKENS: u32 = 160;
 const PORT: u16 = 8098;
 
@@ -78,9 +79,7 @@ pub fn load(model_file: &Path, ctx: usize, kv_type: Option<&str>) -> Option<Tune
         .filter(|t: &Tuned| t.ctx == ctx)
         // Measurements written before tuning was per-context live in a single
         // `tuned.json`; honour it when it happens to be for this context.
-        .or_else(|| {
-            read(model_file.with_file_name("tuned.json")).filter(|t: &Tuned| t.ctx == ctx)
-        })
+        .or_else(|| read(model_file.with_file_name("tuned.json")).filter(|t: &Tuned| t.ctx == ctx))
 }
 
 /// What one configuration achieves, split into the two rates that behave
@@ -141,10 +140,16 @@ async fn measure(endpoint: &str) -> Result<Perf> {
         .send()
         .await?;
     let v: serde_json::Value = r.json().await?;
-    let read = v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let read = v
+        .pointer("/usage/prompt_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
     let prefill_secs = started.elapsed().as_secs_f32();
-    let prefill_tok_s =
-        if read > 0 && prefill_secs > 0.0 { read as f32 / prefill_secs } else { 0.0 };
+    let prefill_tok_s = if read > 0 && prefill_secs > 0.0 {
+        read as f32 / prefill_secs
+    } else {
+        0.0
+    };
 
     let body = serde_json::json!({
         "messages": [{ "role": "user", "content": PROMPT }],
@@ -172,7 +177,10 @@ async fn measure(endpoint: &str) -> Result<Perf> {
             best = best.max(produced as f32 / secs);
         }
     }
-    Ok(Perf { prefill_tok_s, decode_tok_s: best })
+    Ok(Perf {
+        prefill_tok_s,
+        decode_tok_s: best,
+    })
 }
 
 fn vram_of(pid: u32) -> f32 {
@@ -230,10 +238,11 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         ctx,
         kv_type.as_deref().unwrap_or("f16")
     );
-    println!("{} layers, {} experts each; derived estimate is {}", layers, placed.facts.experts, derived.cpu_moe_layers);
     println!(
-        "Optimising for a {PREFILL_TOKENS}-token read plus a {DECODE_TOKENS}-token answer.\n"
+        "{} layers, {} experts each; derived estimate is {}",
+        layers, placed.facts.experts, derived.cpu_moe_layers
     );
+    println!("Optimising for a {PREFILL_TOKENS}-token read plus a {DECODE_TOKENS}-token answer.\n");
     println!(
         "{:>10}  {:>12}  {:>11}  {:>9}  {:>9}",
         "cpu-moe", "prefill tok/s", "decode tok/s", "turn s", "VRAM GB"
@@ -269,7 +278,12 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         flags.ctx = ctx;
 
         let outcome = async {
-            let mut runner = match Runner::start(&path, flags.clone(), PORT, crate::backend::Backend::LlamaCpp) {
+            let mut runner = match Runner::start(
+                &path,
+                flags.clone(),
+                PORT,
+                crate::backend::Backend::LlamaCpp,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     println!("{cpu_moe:>10}  start failed: {e}");
@@ -327,9 +341,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     // can express non-contiguous expert placement (e.g. only early layers'
     // experts on the CPU) that -ncmoe cannot. Keep the best if it beats the
     // sweep winner.
-    let candidate_patterns: Vec<&str> = vec![
-        r"blk\.\d+\.ffn_.*_exps=CPU",
-    ];
+    let candidate_patterns: Vec<&str> = vec![r"blk\.\d+\.ffn_.*_exps=CPU"];
     // Only attempt pattern search if we have a baseline.
     if best.is_some() {
         for pat in candidate_patterns {
@@ -339,7 +351,12 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
             flags.ctx = ctx;
 
             let outcome = async {
-                let mut runner = match Runner::start(&path, flags.clone(), PORT, crate::backend::Backend::LlamaCpp) {
+                let mut runner = match Runner::start(
+                    &path,
+                    flags.clone(),
+                    PORT,
+                    crate::backend::Backend::LlamaCpp,
+                ) {
                     Ok(r) => r,
                     Err(_) => return None,
                 };
@@ -396,7 +413,9 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         );
     }
 
-    let Some((best, _perf)) = best else { bail!("no configuration produced tokens") };
+    let Some((best, _perf)) = best else {
+        bail!("no configuration produced tokens")
+    };
     let _ = best;
     Ok(())
 }
@@ -407,7 +426,9 @@ fn neighbours(centre: usize, layers: usize, done: &[usize]) -> Vec<usize> {
     let mut out = Vec::new();
     for delta in [1isize, 2] {
         for candidate in [centre as isize - delta, centre as isize + delta] {
-            if candidate >= 0 && (candidate as usize) < layers && !done.contains(&(candidate as usize))
+            if candidate >= 0
+                && (candidate as usize) < layers
+                && !done.contains(&(candidate as usize))
             {
                 out.push(candidate as usize);
             }

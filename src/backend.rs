@@ -23,8 +23,8 @@ impl Backend {
     pub fn binary(self) -> &'static str {
         match self {
             Backend::LlamaCpp => "llama-server",
-            Backend::StrataNiko => "strata",       // Niko's engine binary
-            Backend::StrataPoly => "strata-poly",  // PolyStrata's engine
+            Backend::StrataNiko => "strata", // Niko's engine binary
+            Backend::StrataPoly => "strata-poly", // PolyStrata's engine
         }
     }
 }
@@ -34,8 +34,8 @@ pub fn select(arch: &str) -> Backend {
     let a = arch.to_lowercase();
     match a.as_str() {
         "qwen4exp" => Backend::StrataNiko,
-        "glm5-next" | "glm5next" | "qwen35moe" | "clover_moe" | "gemma4"
-        | "deepseek4" | "lfm2moe" | "flint" | "kolibri1" => Backend::StrataPoly,
+        "glm5-next" | "glm5next" | "qwen35moe" | "clover_moe" | "gemma4" | "deepseek4"
+        | "lfm2moe" | "flint" | "kolibri1" => Backend::StrataPoly,
         _ => Backend::LlamaCpp,
     }
 }

@@ -75,7 +75,11 @@ pub async fn run(args: BenchArgs) -> Result<()> {
     println!("strata bench");
     println!("  url           {}", args.url);
     println!("  model         {}", model);
-    println!("  prompt_tokens ~{} (chars {})", args.prompt_tokens, prompt.len());
+    println!(
+        "  prompt_tokens ~{} (chars {})",
+        args.prompt_tokens,
+        prompt.len()
+    );
     println!("  output_tokens {}", args.output_tokens);
     println!();
 
@@ -110,7 +114,9 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         while let Some(pos) = buf.find("\n\n") {
             let frame: String = buf.drain(..=pos + 1).collect();
             for line in frame.lines() {
-                let Some(payload) = line.strip_prefix("data:") else { continue };
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
                 let payload = payload.trim_start();
                 if payload == "[DONE]" {
                     continue;

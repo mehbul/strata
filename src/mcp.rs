@@ -57,7 +57,12 @@ pub async fn run() -> Result<()> {
         let id = req.id.clone().unwrap_or(Value::Null);
         let result = handle(&req.method, &req.params).await;
         let resp = match result {
-            Ok(v) => RpcResponse { jsonrpc: "2.0", id, result: Some(v), error: None },
+            Ok(v) => RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(v),
+                error: None,
+            },
             Err(e) => RpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -88,15 +93,24 @@ async fn handle(method: &str, params: &Value) -> Result<Value> {
             match name {
                 "list_models" => {
                     let entries = crate::registry::scan(&crate::registry::default_root());
-                    Ok(json!({"content": [{"type":"text","text": serde_json::to_string_pretty(&entries).unwrap_or_default()}]}))
+                    Ok(
+                        json!({"content": [{"type":"text","text": serde_json::to_string_pretty(&entries).unwrap_or_default()}]}),
+                    )
                 }
                 "server_status" => {
-                    let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("http://127.0.0.1:8080");
+                    let url = args
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("http://127.0.0.1:8080");
                     let client = reqwest::Client::new();
                     let r = client.get(format!("{}/health", url)).send().await;
                     match r {
-                        Ok(resp) => Ok(json!({"content": [{"type":"text","text": format!("HTTP {}", resp.status())}]})),
-                        Err(e) => Ok(json!({"content": [{"type":"text","text": format!("unreachable: {e}")}], "isError": true})),
+                        Ok(resp) => Ok(
+                            json!({"content": [{"type":"text","text": format!("HTTP {}", resp.status())}]}),
+                        ),
+                        Err(e) => Ok(
+                            json!({"content": [{"type":"text","text": format!("unreachable: {e}")}], "isError": true}),
+                        ),
                     }
                 }
                 _ => anyhow::bail!("unknown tool: {name}"),

@@ -55,7 +55,10 @@ pub fn resolve_path(model: &str) -> Option<PathBuf> {
     for candidate in [
         PathBuf::from("rocm/models").join(&safe).join("model.gguf"),
         PathBuf::from("rocm/models").join(model).join("model.gguf"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rocm/models").join(&safe).join("model.gguf"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rocm/models")
+            .join(&safe)
+            .join("model.gguf"),
     ] {
         if candidate.is_file() {
             return Some(candidate);
@@ -88,11 +91,14 @@ pub fn fill_tiers(
     ram_budget: u64,
 ) -> Tiers {
     if per_expert == 0 || expert_count == 0 {
-        return Tiers { vram_experts: 0, ram_experts: 0, disk_experts: expert_count };
+        return Tiers {
+            vram_experts: 0,
+            ram_experts: 0,
+            disk_experts: expert_count,
+        };
     }
     let vram_experts = ((vram_after_fixed / per_expert) as usize).min(expert_count);
-    let ram_experts =
-        ((ram_budget / per_expert) as usize).min(expert_count - vram_experts);
+    let ram_experts = ((ram_budget / per_expert) as usize).min(expert_count - vram_experts);
     Tiers {
         vram_experts,
         ram_experts,
@@ -139,10 +145,17 @@ impl Placement {
 
         // Dense weights and the KV cache are what must be resident to run at
         // all; experts fill whatever VRAM is left, then RAM, then stay on disk.
-        let per_expert = if expert_count > 0 { expert_bytes / expert_count as u64 } else { 0 };
+        let per_expert = if expert_count > 0 {
+            expert_bytes / expert_count as u64
+        } else {
+            0
+        };
         let vram_after_fixed = vram_budget.saturating_sub(dense_bytes + kv_bytes);
-        let Tiers { vram_experts, ram_experts, disk_experts } =
-            fill_tiers(expert_count, per_expert, vram_after_fixed, ram_budget);
+        let Tiers {
+            vram_experts,
+            ram_experts,
+            disk_experts,
+        } = fill_tiers(expert_count, per_expert, vram_after_fixed, ram_budget);
 
         Ok(Self {
             facts,
@@ -213,7 +226,10 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
 
     println!("=== Placement: {} ===", f.name);
     println!("file            {}", p.path.display());
-    println!("architecture    {}  ({} layers, {} vocab)", f.arch, f.layers, f.vocab);
+    println!(
+        "architecture    {}  ({} layers, {} vocab)",
+        f.arch, f.layers, f.vocab
+    );
     if f.is_moe() {
         println!(
             "experts         {} per layer, top-{} routed  ({} total)",
@@ -229,24 +245,61 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
     println!();
     println!("--- measured from the tensor index ---");
     println!("total weights   {:>8.2} GiB", gib(p.total_weight_bytes));
-    println!("  dense         {:>8.2} GiB   (attention, norms, shared expert, embeddings)", gib(p.dense_bytes));
-    println!("  routed        {:>8.2} GiB   ({} experts, {:.1} MiB each)",
-        gib(p.expert_bytes), p.expert_count,
-        if p.expert_count > 0 { p.expert_bytes as f64 / p.expert_count as f64 / 1024.0 / 1024.0 } else { 0.0 });
-    println!("KV @ {:<7}    {:>8.2} GiB   ({} bytes/token)", ctx, gib(p.kv_bytes), p.kv_bytes_per_token);
+    println!(
+        "  dense         {:>8.2} GiB   (attention, norms, shared expert, embeddings)",
+        gib(p.dense_bytes)
+    );
+    println!(
+        "  routed        {:>8.2} GiB   ({} experts, {:.1} MiB each)",
+        gib(p.expert_bytes),
+        p.expert_count,
+        if p.expert_count > 0 {
+            p.expert_bytes as f64 / p.expert_count as f64 / 1024.0 / 1024.0
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "KV @ {:<7}    {:>8.2} GiB   ({} bytes/token)",
+        ctx,
+        gib(p.kv_bytes),
+        p.kv_bytes_per_token
+    );
     println!();
-    println!("--- solved against {:.1} GiB VRAM / {:.1} GiB RAM ---", vram_gb, ram_gb);
-    println!("must be resident: dense {:.2} + KV {:.2} = {:.2} GiB",
-        gib(p.dense_bytes), gib(p.kv_bytes), gib(p.dense_bytes + p.kv_bytes));
+    println!(
+        "--- solved against {:.1} GiB VRAM / {:.1} GiB RAM ---",
+        vram_gb, ram_gb
+    );
+    println!(
+        "must be resident: dense {:.2} + KV {:.2} = {:.2} GiB",
+        gib(p.dense_bytes),
+        gib(p.kv_bytes),
+        gib(p.dense_bytes + p.kv_bytes)
+    );
     if p.dense_bytes + p.kv_bytes > p.vram_budget {
         println!("  does not fit in VRAM alone — dense weights must spill to RAM");
     }
-    println!("experts in VRAM {:>8}  ({:.0}%)", p.vram_experts, 100.0 * p.vram_fraction());
+    println!(
+        "experts in VRAM {:>8}  ({:.0}%)",
+        p.vram_experts,
+        100.0 * p.vram_fraction()
+    );
     println!("experts in RAM  {:>8}", p.ram_experts);
-    println!("experts on disk {:>8}{}", p.disk_experts,
-        if p.disk_experts > 0 { "   <- streaming required" } else { "" });
+    println!(
+        "experts on disk {:>8}{}",
+        p.disk_experts,
+        if p.disk_experts > 0 {
+            "   <- streaming required"
+        } else {
+            ""
+        }
+    );
     println!();
-    println!("suggested --n-gpu-layers {} of {}", p.gpu_layers(), f.layers);
+    println!(
+        "suggested --n-gpu-layers {} of {}",
+        p.gpu_layers(),
+        f.layers
+    );
     Ok(())
 }
 
@@ -304,7 +357,10 @@ mod tests {
         let vram_left = 16 * GIB - (1.56 * GIB as f64) as u64 - (1.25 * GIB as f64) as u64;
 
         let t = fill_tiers(count, per_expert, vram_left, 21 * GIB);
-        assert_eq!(t.disk_experts, 0, "this configuration is measured and does not spill");
+        assert_eq!(
+            t.disk_experts, 0,
+            "this configuration is measured and does not spill"
+        );
         assert!(t.vram_experts > count / 2, "most experts are on the card");
     }
 
@@ -321,7 +377,11 @@ mod tests {
 
         let t = fill_tiers(count, per_expert, vram_left, 21 * GIB);
         let spill = t.disk_experts as f32 / count as f32;
-        assert!(spill > 0.5, "expected most of a 200B to spill, got {:.0}%", 100.0 * spill);
+        assert!(
+            spill > 0.5,
+            "expected most of a 200B to spill, got {:.0}%",
+            100.0 * spill
+        );
     }
 
     #[test]
@@ -344,6 +404,13 @@ mod tests {
     #[test]
     fn a_dense_model_has_no_experts_to_place() {
         let t = fill_tiers(0, 0, 8 * GIB, 32 * GIB);
-        assert_eq!(t, Tiers { vram_experts: 0, ram_experts: 0, disk_experts: 0 });
+        assert_eq!(
+            t,
+            Tiers {
+                vram_experts: 0,
+                ram_experts: 0,
+                disk_experts: 0
+            }
+        );
     }
 }

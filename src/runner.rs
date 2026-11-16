@@ -47,9 +47,17 @@ impl Runtime {
                 roots.push(PathBuf::from(local).join("Programs/Ollama/lib/ollama"));
             }
             for root in roots {
-                let server = root.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
+                let server = root.join(if cfg!(windows) {
+                    "llama-server.exe"
+                } else {
+                    "llama-server"
+                });
                 if server.is_file() {
-                    return Some(Self { backend: pick_backend(&root), server, lib_dir: root });
+                    return Some(Self {
+                        backend: pick_backend(&root),
+                        server,
+                        lib_dir: root,
+                    });
                 }
             }
             return None;
@@ -57,9 +65,17 @@ impl Runtime {
         // Specialized backend: look in runtime/<name>/
         let root = PathBuf::from("runtime").join(backend.as_str());
         let bin = backend.binary();
-        let server = root.join(if cfg!(windows) { format!("{}.exe", bin) } else { bin.to_string() });
+        let server = root.join(if cfg!(windows) {
+            format!("{}.exe", bin)
+        } else {
+            bin.to_string()
+        });
         if server.is_file() {
-            Some(Self { backend: None, server, lib_dir: root })
+            Some(Self {
+                backend: None,
+                server,
+                lib_dir: root,
+            })
         } else {
             None
         }
@@ -71,11 +87,19 @@ impl Runtime {
 /// Official llama.cpp releases put the backend beside the binary; Ollama's
 /// layout puts it in a per-GPU subdirectory. Both are handled.
 fn pick_backend(root: &Path) -> Option<PathBuf> {
-    let lib = if cfg!(windows) { "ggml-hip.dll" } else { "libggml-hip.so" };
+    let lib = if cfg!(windows) {
+        "ggml-hip.dll"
+    } else {
+        "libggml-hip.so"
+    };
     if root.join(lib).is_file() {
         return Some(root.join(lib));
     }
-    let vk_lib = if cfg!(windows) { "ggml-vulkan.dll" } else { "libggml-vulkan.so" };
+    let vk_lib = if cfg!(windows) {
+        "ggml-vulkan.dll"
+    } else {
+        "libggml-vulkan.so"
+    };
     if root.join(vk_lib).is_file() {
         return Some(root.join(vk_lib));
     }
@@ -92,7 +116,11 @@ fn pick_backend(root: &Path) -> Option<PathBuf> {
             break;
         }
         if name.starts_with("vulkan") && best.is_none() {
-            let vk = dir.join(if cfg!(windows) { "ggml-vulkan.dll" } else { "libggml-vulkan.so" });
+            let vk = dir.join(if cfg!(windows) {
+                "ggml-vulkan.dll"
+            } else {
+                "libggml-vulkan.so"
+            });
             if vk.is_file() {
                 best = Some(vk);
             }
@@ -155,7 +183,10 @@ impl Flags {
             ctx: p.ctx,
             cpu_moe_layers: layers.saturating_sub(gpu_expert_layers.min(layers)),
             flash_attention: true,
-            threads: std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(6).max(1),
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(6)
+                .max(1),
             expert_override: None,
             kv_type: None,
             draft_model: None,
@@ -285,7 +316,12 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn start(model: &Path, flags: Flags, port: u16, backend: crate::backend::Backend) -> Result<Self> {
+    pub fn start(
+        model: &Path,
+        flags: Flags,
+        port: u16,
+        backend: crate::backend::Backend,
+    ) -> Result<Self> {
         let mut backend = backend;
         // Resolve: if specialized binary missing, fall back to llama.cpp.
         let runtime = match crate::runner::Runtime::discover_for(backend) {
@@ -317,8 +353,9 @@ impl Runner {
         if let Some(backend) = &runtime.backend {
             cmd.env("GGML_BACKEND_PATH", backend);
         }
-        let mut child =
-            cmd.spawn().with_context(|| format!("starting {}", runtime.server.display()))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("starting {}", runtime.server.display()))?;
 
         // stderr must be drained or the pipe fills and the child blocks on its
         // own logging, so a reader thread owns it for the life of the process.
@@ -339,7 +376,13 @@ impl Runner {
             });
         }
 
-        Ok(Self { child, endpoint: format!("http://127.0.0.1:{port}"), flags, runtime, log })
+        Ok(Self {
+            child,
+            endpoint: format!("http://127.0.0.1:{port}"),
+            flags,
+            runtime,
+            log,
+        })
     }
 
     /// The tail of the compute process's log, newest last.
@@ -368,7 +411,12 @@ impl Runner {
         let client = reqwest::Client::new();
         let url = format!("{}/health", self.endpoint);
         while started.elapsed() < timeout {
-            if let Ok(r) = client.get(&url).timeout(Duration::from_secs(3)).send().await {
+            if let Ok(r) = client
+                .get(&url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+            {
                 if r.status().is_success() {
                     print!("\r                                     \r");
                     let _ = std::io::stdout().flush();
@@ -398,9 +446,17 @@ impl Runner {
 /// only the device summary and anything that went wrong belong on the console.
 fn is_interesting(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
-    ["error", "failed", "cannot", "unable to", "out of memory", "not supported", "warning: failed"]
-        .iter()
-        .any(|k| l.contains(k))
+    [
+        "error",
+        "failed",
+        "cannot",
+        "unable to",
+        "out of memory",
+        "not supported",
+        "warning: failed",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
         || l.starts_with("load_tensors: offloading")
         || l.starts_with("ggml_cuda_init")
 }
@@ -442,17 +498,26 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-m", "model.gguf",
-                "--host", "127.0.0.1",
-                "--port", "8099",
-                "-c", "65536",
-                "-ngl", "99",
-                "-t", "6",
+                "-m",
+                "model.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8099",
+                "-c",
+                "65536",
+                "-ngl",
+                "99",
+                "-t",
+                "6",
                 "--no-webui",
-                "-np", "1",
+                "-np",
+                "1",
                 "--jinja",
-                "-ncmoe", "15",
-                "-fa", "on",
+                "-ncmoe",
+                "15",
+                "-fa",
+                "on",
             ]
         );
     }
@@ -471,7 +536,11 @@ mod tests {
         let mut flags = base();
         flags.kv_type = Some("q8_0".into());
         let args = flags.to_args(Path::new("model.gguf"), 8099);
-        let at = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+        let at = |k: &str| {
+            args.iter()
+                .position(|a| a == k)
+                .map(|i| args[i + 1].clone())
+        };
         assert_eq!(at("-ctk").as_deref(), Some("q8_0"));
         assert_eq!(at("-ctv").as_deref(), Some("q8_0"));
     }

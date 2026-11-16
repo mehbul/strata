@@ -117,7 +117,9 @@ pub fn probe(runtime: &Runtime) -> Result<Machine> {
         devices,
         ram_total_gb,
         ram_avail_gb,
-        cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
     })
 }
 
@@ -131,23 +133,39 @@ fn parse_devices(text: &str) -> Vec<Device> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        let Some((id, rest)) = line.split_once(": ") else { continue };
+        let Some((id, rest)) = line.split_once(": ") else {
+            continue;
+        };
         let id = id.trim();
         if id.is_empty() || id.contains(' ') {
             continue;
         }
-        let Some(open) = rest.rfind('(') else { continue };
-        let Some(close) = rest[open..].find(')') else { continue };
+        let Some(open) = rest.rfind('(') else {
+            continue;
+        };
+        let Some(close) = rest[open..].find(')') else {
+            continue;
+        };
         let name = rest[..open].trim().to_string();
         let inside = &rest[open + 1..open + close];
         let mut sizes = inside.split(',').filter_map(|part| {
-            part.trim().split_whitespace().next().and_then(|n| n.parse::<u64>().ok())
+            part.trim()
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
         });
-        let (Some(total_mib), Some(free_mib)) = (sizes.next(), sizes.next()) else { continue };
+        let (Some(total_mib), Some(free_mib)) = (sizes.next(), sizes.next()) else {
+            continue;
+        };
         if name.is_empty() || total_mib == 0 {
             continue;
         }
-        out.push(Device { id: id.to_string(), name, total_mib, free_mib });
+        out.push(Device {
+            id: id.to_string(),
+            name,
+            total_mib,
+            free_mib,
+        });
     }
     out
 }
@@ -161,7 +179,12 @@ mod tests {
         ROCm1: AMD Radeon(TM) Graphics (12472 MiB, 12189 MiB free)\n";
 
     fn machine(devices: Vec<Device>) -> Machine {
-        Machine { devices, ram_total_gb: 32.0, ram_avail_gb: 20.0, cores: 12 }
+        Machine {
+            devices,
+            ram_total_gb: 32.0,
+            ram_avail_gb: 20.0,
+            cores: 12,
+        }
     }
 
     #[test]
@@ -200,7 +223,10 @@ mod tests {
     #[test]
     fn ram_budget_holds_back_room_for_the_system() {
         assert_eq!(machine(vec![]).ram_budget_gb(), 16.0);
-        let tight = Machine { ram_avail_gb: 2.0, ..machine(vec![]) };
+        let tight = Machine {
+            ram_avail_gb: 2.0,
+            ..machine(vec![])
+        };
         assert_eq!(tight.ram_budget_gb(), 0.0);
     }
 }

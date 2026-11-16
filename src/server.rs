@@ -138,9 +138,10 @@ fn cpu_name() -> String {
 /// process doing the work can actually see. `rocm::detect()` is consulted only
 /// to add a gfx target where one is known.
 fn probe_hw() -> Hw {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    let probed = crate::runner::Runtime::discover()
-        .and_then(|rt| crate::hardware::probe(&rt).ok());
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let probed = crate::runner::Runtime::discover().and_then(|rt| crate::hardware::probe(&rt).ok());
     let (gpu, gpus, vram_total_gb) = match &probed {
         Some(m) => {
             let name = match m.primary() {
@@ -153,11 +154,21 @@ fn probe_hw() -> Hw {
                 }
                 None => "no GPU detected".to_string(),
             };
-            (name, m.devices.len(), m.primary().map(|d| d.total_gb()).unwrap_or(0.0))
+            (
+                name,
+                m.devices.len(),
+                m.primary().map(|d| d.total_gb()).unwrap_or(0.0),
+            )
         }
         None => ("no GPU detected".to_string(), 0, 0.0),
     };
-    Hw { cores, cpu: cpu_name(), gpu, gpus, vram_total_gb }
+    Hw {
+        cores,
+        cpu: cpu_name(),
+        gpu,
+        gpus,
+        vram_total_gb,
+    }
 }
 
 // --------------------------------------------------------------- scheduler
@@ -288,7 +299,6 @@ impl Experts {
         }
         s
     }
-
 }
 
 // ----------------------------------------------------------------- profile
@@ -375,7 +385,12 @@ impl Compute {
         if self.is_loaded() {
             return Ok(std::time::Duration::ZERO);
         }
-        let mut r = crate::runner::Runner::start(&self.model_path, self.flags.clone(), self.port, self.backend)?;
+        let mut r = crate::runner::Runner::start(
+            &self.model_path,
+            self.flags.clone(),
+            self.port,
+            self.backend,
+        )?;
         let took = r.wait_ready(std::time::Duration::from_secs(600)).await?;
         self.runner = Some(r);
         Ok(took)
@@ -453,8 +468,11 @@ impl Msg {
         match self.extra.get("tool_calls") {
             None => base,
             Some(calls) if base.is_empty() => calls.to_string(),
-            Some(calls) => format!("{}
-{calls}", base),
+            Some(calls) => format!(
+                "{}
+{calls}",
+                base
+            ),
         }
     }
 }
@@ -576,7 +594,9 @@ fn no_compute() -> Response {
 /// turn is running against it. Otherwise an in-flight stream would die
 /// mid-token with a transport error rather than a reason.
 async fn unload_model(State(state): State<Shared>) -> Response {
-    let Some(compute) = &state.compute else { return no_compute() };
+    let Some(compute) = &state.compute else {
+        return no_compute();
+    };
 
     let drained = tokio::time::timeout(
         std::time::Duration::from_secs(DRAIN_TIMEOUT_S),
@@ -610,7 +630,9 @@ async fn unload_model(State(state): State<Shared>) -> Response {
 
 /// POST /model/load - start the compute process again.
 async fn load_model(State(state): State<Shared>) -> Response {
-    let Some(compute) = &state.compute else { return no_compute() };
+    let Some(compute) = &state.compute else {
+        return no_compute();
+    };
     let mut c = compute.lock().await;
     if c.is_loaded() {
         return Json(json!({ "loaded": true, "changed": false })).into_response();
@@ -656,7 +678,11 @@ fn model_unloaded() -> Response {
 }
 
 async fn profile(State(state): State<Shared>) -> Json<Value> {
-    let turns = state.profile.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let turns = state
+        .profile
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(json!({ "seq": turns.len(), "turns": turns }))
 }
 
@@ -675,31 +701,58 @@ async fn metrics(State(state): State<Shared>) -> String {
     let mut out = String::new();
     out.push_str("# HELP strata_requests_total Total chat completion requests.\n");
     out.push_str("# TYPE strata_requests_total counter\n");
-    out.push_str(&format!("strata_requests_total {}\n", m.requests_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_requests_total {}\n",
+        m.requests_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_requests_in_flight Requests currently in flight.\n");
     out.push_str("# TYPE strata_requests_in_flight gauge\n");
-    out.push_str(&format!("strata_requests_in_flight {}\n", m.requests_in_flight.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_requests_in_flight {}\n",
+        m.requests_in_flight.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_prompt_tokens_total Total prompt tokens processed.\n");
     out.push_str("# TYPE strata_prompt_tokens_total counter\n");
-    out.push_str(&format!("strata_prompt_tokens_total {}\n", m.prompt_tokens_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_prompt_tokens_total {}\n",
+        m.prompt_tokens_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_completion_tokens_total Total completion tokens generated.\n");
     out.push_str("# TYPE strata_completion_tokens_total counter\n");
-    out.push_str(&format!("strata_completion_tokens_total {}\n", m.completion_tokens_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_completion_tokens_total {}\n",
+        m.completion_tokens_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_rejected_total Rejected requests (upstream unavailable).\n");
     out.push_str("# TYPE strata_rejected_total counter\n");
-    out.push_str(&format!("strata_rejected_total {}\n", m.rejected_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_rejected_total {}\n",
+        m.rejected_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_timed_out_total Requests that timed out in queue.\n");
     out.push_str("# TYPE strata_timed_out_total counter\n");
-    out.push_str(&format!("strata_timed_out_total {}\n", m.timed_out_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_timed_out_total {}\n",
+        m.timed_out_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_cancelled_total Cancelled requests.\n");
     out.push_str("# TYPE strata_cancelled_total counter\n");
-    out.push_str(&format!("strata_cancelled_total {}\n", m.cancelled_total.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_cancelled_total {}\n",
+        m.cancelled_total.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_sched_active Active scheduler slots.\n");
     out.push_str("# TYPE strata_sched_active gauge\n");
-    out.push_str(&format!("strata_sched_active {}\n", state.sched.active.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_sched_active {}\n",
+        state.sched.active.load(Ordering::Relaxed)
+    ));
     out.push_str("# HELP strata_sched_completed Completed turns.\n");
     out.push_str("# TYPE strata_sched_completed counter\n");
-    out.push_str(&format!("strata_sched_completed {}\n", state.sched.completed.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "strata_sched_completed {}\n",
+        state.sched.completed.load(Ordering::Relaxed)
+    ));
     out
 }
 
@@ -707,7 +760,12 @@ async fn metrics(State(state): State<Shared>) -> String {
 /// this instance was started with.
 async fn models(State(state): State<Shared>) -> Json<Value> {
     let mut ids = vec![state.model.lock().unwrap().clone()];
-    if let Ok(resp) = state.client.get(format!("{}/v1/models", state.upstream)).send().await {
+    if let Ok(resp) = state
+        .client
+        .get(format!("{}/v1/models", state.upstream))
+        .send()
+        .await
+    {
         if let Ok(body) = resp.json::<Value>().await {
             if let Some(list) = body.get("data").and_then(|m| m.as_array()) {
                 for m in list {
@@ -789,7 +847,11 @@ async fn api_models_load(State(state): State<Shared>, Json(req): Json<LoadModelR
 
     // Wait for in-flight to drain (best effort, up to 30s).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while state.sched.active.load(std::sync::atomic::Ordering::Relaxed) > 0
+    while state
+        .sched
+        .active
+        .load(std::sync::atomic::Ordering::Relaxed)
+        > 0
         && std::time::Instant::now() < deadline
     {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -868,15 +930,28 @@ async fn api_models_unload(State(state): State<Shared>) -> Json<Value> {
 /// into a truncated prompt.
 async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>) -> Response {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-    state.metrics.requests_in_flight.fetch_add(1, Ordering::Relaxed);
-    let model = if req.model.is_empty() { state.model.lock().unwrap().clone() } else { req.model.clone() };
+    state
+        .metrics
+        .requests_in_flight
+        .fetch_add(1, Ordering::Relaxed);
+    let model = if req.model.is_empty() {
+        state.model.lock().unwrap().clone()
+    } else {
+        req.model.clone()
+    };
     let id = format!("chatcmpl-{}", uid());
     let admitted = Instant::now();
     let permit = match admit(&state).await {
         Some(p) => p,
         None => {
-            state.metrics.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
-            state.metrics.timed_out_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .requests_in_flight
+                .fetch_sub(1, Ordering::Relaxed);
+            state
+                .metrics
+                .timed_out_total
+                .fetch_add(1, Ordering::Relaxed);
             return queue_full();
         }
     };
@@ -896,10 +971,16 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
 
     let reply_budget = req.max_completion_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     // Held until the permit is, so only `KV_SLOTS` summaries can run at once.
-    let prepared = state.compactor.prepare(&req.messages, reply_budget as usize).await;
+    let prepared = state
+        .compactor
+        .prepare(&req.messages, reply_budget as usize)
+        .await;
     let (messages, compaction) = match prepared {
         crate::compact::Prepared::AsIs { tokens } => (&req.messages, Report::fits(tokens)),
-        crate::compact::Prepared::Compacted { ref messages, ref event } => {
+        crate::compact::Prepared::Compacted {
+            ref messages,
+            ref event,
+        } => {
             println!(
                 "  compacted: {} -> {} tokens ({} messages summarised, {} kept, {}ms{})",
                 event.before_tokens,
@@ -962,14 +1043,21 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
         // The compute process already answers in OpenAI shape; forward it as-is
         // and read the usage block only to record the turn.
         let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
-        let prompt_tokens = body.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let completion_tokens =
-            body.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prompt_tokens = body
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let completion_tokens = body
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         guard.complete(admitted, prompt_tokens, completion_tokens);
         Json(body).into_response()
     } else {
         let stream = upstream_sse(guard, resp, id.clone(), model, admitted);
-        Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     };
 
     let headers = response.headers_mut();
@@ -981,8 +1069,18 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
     tag("x-request-id", id);
     tag("x-strata-queue-wait-ms", queue_wait_ms.to_string());
     tag("x-strata-context-tokens", compaction.tokens.to_string());
-    tag("x-strata-context-budget", state.compactor.budget(reply_budget as usize).to_string());
-    tag("x-strata-compacted", if compaction.happened { "1".into() } else { "0".into() });
+    tag(
+        "x-strata-context-budget",
+        state.compactor.budget(reply_budget as usize).to_string(),
+    );
+    tag(
+        "x-strata-compacted",
+        if compaction.happened {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    );
     if let Some(reclaimed) = compaction.reclaimed {
         tag("x-strata-compacted-tokens", reclaimed.to_string());
     }
@@ -1000,7 +1098,11 @@ struct Report {
 
 impl Report {
     fn fits(tokens: usize) -> Self {
-        Self { tokens, happened: false, reclaimed: None }
+        Self {
+            tokens,
+            happened: false,
+            reclaimed: None,
+        }
     }
 
     fn compacted(event: &crate::compact::Event) -> Self {
@@ -1070,7 +1172,9 @@ fn upstream_sse(
                 let frame: String = st.buf.drain(..pos + sep).collect();
                 let mut events = Vec::new();
                 for line in frame.lines() {
-                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
                     let payload = payload.trim_start();
                     if payload == "[DONE]" {
                         st.guard.complete_if_open(st.started);
@@ -1081,7 +1185,10 @@ fn upstream_sse(
                     if let Ok(v) = serde_json::from_str::<Value>(payload) {
                         if let Some(u) = v.get("usage") {
                             let pt = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                            let ct = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let ct = u
+                                .get("completion_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0);
                             if pt + ct > 0 {
                                 st.guard.complete(st.started, pt, ct);
                             }
@@ -1162,14 +1269,21 @@ impl TurnGuard {
     fn new(shared: Shared, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
         shared.sched.admitted.fetch_add(1, Ordering::Relaxed);
         shared.sched.active.fetch_add(1, Ordering::Relaxed);
-        Self { shared, settled: false, _permit: permit }
+        Self {
+            shared,
+            settled: false,
+            _permit: permit,
+        }
     }
 
     fn reject(&mut self) {
         if !self.settled {
             self.settled = true;
             self.shared.sched.rejected.fetch_add(1, Ordering::Relaxed);
-            self.shared.metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .metrics
+                .rejected_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1188,8 +1302,14 @@ impl TurnGuard {
         self.settled = true;
         self.shared.sched.completed.fetch_add(1, Ordering::Relaxed);
 
-        self.shared.metrics.prompt_tokens_total.fetch_add(prompt_tokens, Ordering::Relaxed);
-        self.shared.metrics.completion_tokens_total.fetch_add(completion_tokens, Ordering::Relaxed);
+        self.shared
+            .metrics
+            .prompt_tokens_total
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.shared
+            .metrics
+            .completion_tokens_total
+            .fetch_add(completion_tokens, Ordering::Relaxed);
 
         let turn = ProfileTurn {
             wall_s: started.elapsed().as_secs_f32(),
@@ -1200,7 +1320,11 @@ impl TurnGuard {
             // profiling view folds the remainder into "other" rather than guessing.
             ..Default::default()
         };
-        let mut p = self.shared.profile.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self
+            .shared
+            .profile
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         p.push(turn);
         let overflow = p.len().saturating_sub(PROFILE_KEEP);
         if overflow > 0 {
@@ -1208,7 +1332,11 @@ impl TurnGuard {
         }
         drop(p);
 
-        let mut e = self.shared.experts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = self
+            .shared
+            .experts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for _ in 0..completion_tokens.min(512) {
             e.tick();
         }
@@ -1218,10 +1346,16 @@ impl TurnGuard {
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         self.shared.sched.active.fetch_sub(1, Ordering::Relaxed);
-        self.shared.metrics.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.shared
+            .metrics
+            .requests_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
         if !self.settled {
             self.shared.sched.cancelled.fetch_add(1, Ordering::Relaxed);
-            self.shared.metrics.cancelled_total.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .metrics
+                .cancelled_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1247,7 +1381,7 @@ pub fn is_loopback(listen: &str) -> bool {
         Some((h, _)) => h.trim_start_matches('[').trim_end_matches(']'),
         None => listen,
     };
-    matches!(host, "localhost" | "::1" | "" ) || host.starts_with("127.")
+    matches!(host, "localhost" | "::1" | "") || host.starts_with("127.")
 }
 
 /// Compare a presented key with the expected one without leaking, through
@@ -1341,7 +1475,22 @@ pub struct ServeOptions {
 }
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
-    let ServeOptions { listen, model, ctx, cpu_moe, upstream, compact, kv_type, api_key, draft, spec, mmproj, devices, tensor_split, backend } = opts;
+    let ServeOptions {
+        listen,
+        model,
+        ctx,
+        cpu_moe,
+        upstream,
+        compact,
+        kv_type,
+        api_key,
+        draft,
+        spec,
+        mmproj,
+        devices,
+        tensor_split,
+        backend,
+    } = opts;
 
     // A public address with no key hands the GPU to anything that can reach the
     // port. Refusing is the only safe default; loopback stays open because
@@ -1374,7 +1523,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
 
     // Backend selection: auto by architecture, or explicit override.
-    let arch = placed.as_ref().map(|p| p.facts.arch.clone()).unwrap_or_default();
+    let arch = placed
+        .as_ref()
+        .map(|p| p.facts.arch.clone())
+        .unwrap_or_default();
     let mut selected_backend = match backend.as_deref() {
         Some("niko") => crate::backend::Backend::StrataNiko,
         Some("poly") => crate::backend::Backend::StrataPoly,
@@ -1413,7 +1565,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 if let Some(p) = &placed {
                     let _ = p;
                 }
-                let model_dir = std::path::Path::new(&model).parent().unwrap_or(std::path::Path::new("."));
+                let model_dir = std::path::Path::new(&model)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
                 // model is a name, not path; search rocm/models/<model>
                 let dir = std::path::PathBuf::from("rocm/models").join(&model);
                 if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1455,7 +1609,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             if let Some(pattern) = &flags.expert_override {
                 println!("  placement {pattern}");
             }
-            let mut r = crate::runner::Runner::start(model_path, flags.clone(), 8099, selected_backend)?;
+            let mut r =
+                crate::runner::Runner::start(model_path, flags.clone(), 8099, selected_backend)?;
             println!("  runtime {}", r.runtime.server.display());
             if let Some(b) = &r.runtime.backend {
                 println!("  backend {}", b.display());
@@ -1485,8 +1640,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let compactor =
-        crate::compact::Compactor::new(ctx, endpoint.clone(), client.clone(), compact);
+    let compactor = crate::compact::Compactor::new(ctx, endpoint.clone(), client.clone(), compact);
 
     println!("Serving strata on http://{listen}");
     match (&api_key, is_loopback(&listen)) {
@@ -1505,7 +1659,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
              summarised back to ~{keep}"
         );
     } else {
-        println!("  Compaction  off (--no-compact); a conversation past {ctx} tokens will overflow");
+        println!(
+            "  Compaction  off (--no-compact); a conversation past {ctx} tokens will overflow"
+        );
     }
     println!("  NOTE: the expert map in /experts is SIMULATED; the router is not observable yet.");
 
@@ -1529,8 +1685,14 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             total_gb: p.total_weight_bytes as f32 / 1073741824.0,
         }),
         hw: probe_hw(),
-        vram_gb: placed.as_ref().map(|p| p.vram_budget as f32 / 1073741824.0).unwrap_or(0.0),
-        ram_gb: placed.as_ref().map(|p| p.ram_budget as f32 / 1073741824.0).unwrap_or(0.0),
+        vram_gb: placed
+            .as_ref()
+            .map(|p| p.vram_budget as f32 / 1073741824.0)
+            .unwrap_or(0.0),
+        ram_gb: placed
+            .as_ref()
+            .map(|p| p.ram_budget as f32 / 1073741824.0)
+            .unwrap_or(0.0),
         sched: Sched::default(),
         metrics: Metrics::default(),
         permits: Arc::new(tokio::sync::Semaphore::new(KV_SLOTS)),
@@ -1540,7 +1702,6 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     // Kept out of the router so the compute process can still be stopped after
     // the server has finished shutting down.
     let shutdown_state = state.clone();
-
 
     let api = Router::new()
         .route("/health", get(health))
@@ -1560,7 +1721,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .route("/api/models/unload", post(api_models_unload))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), require_key))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_key,
+        ))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
@@ -1575,8 +1739,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     // web/dist holds the built console.
     let web_dist = std::path::Path::new("web/dist");
     let app = if web_dist.exists() {
-        let serve_dir = tower_http::services::ServeDir::new(web_dist)
-            .not_found_service(tower_http::services::ServeFile::new(web_dist.join("index.html")));
+        let serve_dir = tower_http::services::ServeDir::new(web_dist).not_found_service(
+            tower_http::services::ServeFile::new(web_dist.join("index.html")),
+        );
         api.fallback_service(serve_dir)
     } else {
         println!("  (web/dist missing - run `npm install && npm run build` in web/ for the UI)");
@@ -1627,9 +1792,11 @@ async fn wait_for_signal() {
         use tokio::signal::windows;
         // Registration only fails where there is no console to signal us, and
         // plain Ctrl+C is still worth waiting on if it does.
-        if let (Ok(mut interrupt), Ok(mut close), Ok(mut shutdown)) =
-            (windows::ctrl_c(), windows::ctrl_close(), windows::ctrl_shutdown())
-        {
+        if let (Ok(mut interrupt), Ok(mut close), Ok(mut shutdown)) = (
+            windows::ctrl_c(),
+            windows::ctrl_close(),
+            windows::ctrl_shutdown(),
+        ) {
             tokio::select! {
                 _ = interrupt.recv() => {}
                 _ = close.recv() => {}
@@ -1647,7 +1814,12 @@ mod access_tests {
 
     #[test]
     fn loopback_addresses_are_recognised() {
-        for listen in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "127.5.5.5:1"] {
+        for listen in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "[::1]:8080",
+            "127.5.5.5:1",
+        ] {
             assert!(is_loopback(listen), "{listen} should be loopback");
         }
     }
@@ -1656,7 +1828,12 @@ mod access_tests {
     fn everything_reachable_from_outside_is_not() {
         // 0.0.0.0 is the one that matters: it is what someone types when they
         // want a friend to connect, and it is the one that must demand a key.
-        for listen in ["0.0.0.0:8080", "192.168.1.20:8080", "[::]:8080", "10.0.0.5:80"] {
+        for listen in [
+            "0.0.0.0:8080",
+            "192.168.1.20:8080",
+            "[::]:8080",
+            "10.0.0.5:80",
+        ] {
             assert!(!is_loopback(listen), "{listen} should not be loopback");
         }
     }

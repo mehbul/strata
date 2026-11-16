@@ -171,8 +171,7 @@ impl Compactor {
     /// for a request reserving `reserve` tokens for its reply.
     pub fn thresholds(&self, reserve: usize) -> (usize, usize) {
         let budget = self.budget(reserve);
-        let after =
-            budget as f32 * (1.0 - DROP_FRACTION) + summary_budget(budget) as f32;
+        let after = budget as f32 * (1.0 - DROP_FRACTION) + summary_budget(budget) as f32;
         ((budget as f32 * TRIGGER_FRACTION) as usize, after as usize)
     }
 
@@ -182,8 +181,12 @@ impl Compactor {
         let total: usize = counts.iter().sum();
         let budget = self.budget(reserve);
         let trigger = (budget as f32 * TRIGGER_FRACTION) as usize;
-        self.stats.last_budget.store(budget as u64, Ordering::Relaxed);
-        self.stats.last_prompt.store(total as u64, Ordering::Relaxed);
+        self.stats
+            .last_budget
+            .store(budget as u64, Ordering::Relaxed);
+        self.stats
+            .last_prompt
+            .store(total as u64, Ordering::Relaxed);
         if !self.enabled || budget == 0 || total <= trigger {
             return Prepared::AsIs { tokens: total };
         }
@@ -208,11 +211,19 @@ impl Compactor {
         }
 
         let digest = digest_of(prior.as_deref(), middle);
-        let cached = self.summaries.lock().unwrap_or_else(|e| e.into_inner()).get(&digest).cloned();
+        let cached = self
+            .summaries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&digest)
+            .cloned();
         let reused = cached.is_some();
         let summary = match cached {
             Some(s) => s,
-            None => match self.summarise(prior.as_deref(), middle, summary_tokens).await {
+            None => match self
+                .summarise(prior.as_deref(), middle, summary_tokens)
+                .await
+            {
                 // Only a real summary is cached. Caching the failure note would
                 // make one timeout permanent for that conversation: every later
                 // turn would find it, reuse it, and never try again - the whole
@@ -240,7 +251,11 @@ impl Compactor {
 
         let mut out: Vec<Msg> = Vec::with_capacity(head_len + 1 + messages.len() - start);
         out.extend(messages[..head_len.saturating_sub(1)].iter().cloned());
-        out.push(Msg { role: "system".into(), content: serde_json::Value::String(system), ..Default::default() });
+        out.push(Msg {
+            role: "system".into(),
+            content: serde_json::Value::String(system),
+            ..Default::default()
+        });
         out.extend(messages[start..].iter().cloned());
 
         let after: usize = self.measure(&out).await.iter().sum();
@@ -258,16 +273,28 @@ impl Compactor {
         } else {
             self.stats.summarised.fetch_add(1, Ordering::Relaxed);
         }
-        self.stats.reclaimed.fetch_add(total.saturating_sub(after) as u64, Ordering::Relaxed);
-        self.stats.last_prompt.store(after as u64, Ordering::Relaxed);
+        self.stats
+            .reclaimed
+            .fetch_add(total.saturating_sub(after) as u64, Ordering::Relaxed);
+        self.stats
+            .last_prompt
+            .store(after as u64, Ordering::Relaxed);
         *self.stats.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(event.clone());
 
-        Prepared::Compacted { messages: out, event }
+        Prepared::Compacted {
+            messages: out,
+            event,
+        }
     }
 
     /// Current settings and what compaction has done so far.
     pub fn report(&self) -> Value {
-        let last = self.stats.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let last = self
+            .stats
+            .last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         json!({
             "enabled": self.enabled,
             "ctx": self.ctx,
@@ -364,8 +391,7 @@ impl Compactor {
             // After the first turn of a conversation only the newest messages
             // are unseen.
             let texts: Vec<String> = missing.iter().map(|&i| messages[i].text()).collect();
-            let fetched =
-                futures::future::join_all(texts.iter().map(|t| self.tokenize(t))).await;
+            let fetched = futures::future::join_all(texts.iter().map(|t| self.tokenize(t))).await;
             let mut cache = self.counts.lock().unwrap_or_else(|e| e.into_inner());
             for (&i, n) in missing.iter().zip(fetched) {
                 out[i] = n;
@@ -520,7 +546,11 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> Msg {
-        Msg { role: role.into(), content: serde_json::Value::String(content.to_string()), ..Default::default() }
+        Msg {
+            role: role.into(),
+            content: serde_json::Value::String(content.to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -560,8 +590,14 @@ mod tests {
         let (mut m, mut counts) = conversation(30);
         let (budget, trigger) = (5000, 4000);
         let first = boundary(&counts, &m, 1, budget, trigger, 768);
-        assert!(first > 1 && first < m.len(), "cut lands inside the conversation");
-        assert_eq!(m[first].role, "user", "the kept tail opens on a user message");
+        assert!(
+            first > 1 && first < m.len(),
+            "cut lands inside the conversation"
+        );
+        assert_eq!(
+            m[first].role, "user",
+            "the kept tail opens on a user message"
+        );
 
         // Two more turns arrive. The cut is measured from the start, so it must
         // stay put - that is what keeps the summary cached and the KV prefix
@@ -625,14 +661,20 @@ mod tests {
 
     #[test]
     fn a_small_summary_still_gets_a_usable_floor() {
-        assert_eq!(summary_timeout(0, 0), Duration::from_secs(SUMMARY_TIMEOUT_FLOOR_S));
+        assert_eq!(
+            summary_timeout(0, 0),
+            Duration::from_secs(SUMMARY_TIMEOUT_FLOOR_S)
+        );
     }
 
     #[test]
     fn reserve_is_capped_at_a_third_of_context() {
         let c = Compactor::new(8192, String::new(), reqwest::Client::new(), true);
         // A client asking to reserve half the window gets a third.
-        assert_eq!(c.budget(4096), 8192 - (8192.0 * MAX_RESERVE_FRACTION) as usize - SAFETY_TOKENS);
+        assert_eq!(
+            c.budget(4096),
+            8192 - (8192.0 * MAX_RESERVE_FRACTION) as usize - SAFETY_TOKENS
+        );
         // A modest request is honoured as asked.
         assert_eq!(c.budget(512), 8192 - 512 - SAFETY_TOKENS);
     }
