@@ -34,6 +34,12 @@ const LADDER: [usize; 8] = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 26214
 /// which is the only real evidence this number has behind it.
 const KV_SHARE_OF_VRAM: f32 = 0.10;
 
+/// On a dense model the KV cache competes only with the compute buffers, not
+/// with experts, so it may draw on this share of the VRAM left after the
+/// weights. Half keeps a real margin: filling the card to the last byte leaves
+/// nothing for the buffers llama.cpp allocates at load.
+const DENSE_KV_SHARE_OF_FREE: f64 = 0.5;
+
 /// Below this there is no point continuing: the weights that must be resident
 /// to run at all would not fit beside even a minimal cache.
 const MIN_CONTEXT: usize = 2048;
@@ -68,13 +74,42 @@ pub struct Choice {
 /// Largest context whose KV cache stays within its share of the card.
 ///
 /// Bigger is not better. A context the machine can technically allocate still
-/// costs expert residency for the entire run, and a conversation that never
-/// reaches the end of a smaller window has paid that for nothing - compaction
-/// covers the overflow. So this picks the largest context that stays cheap,
-/// not the largest that fits.
-pub fn choose_context(facts_ctx: usize, kv_bytes_per_token: u64, vram_gb: f32) -> usize {
+/// costs residency for the entire run, and a conversation that never reaches the
+/// end of a smaller window has paid that for nothing - compaction covers the
+/// overflow. So this picks the largest context that stays cheap, not the largest
+/// that fits.
+///
+/// "Cheap" means different things depending on whether there are experts to
+/// protect. On a mixture-of-experts model every byte of KV cache is VRAM an
+/// expert cannot have, so the cache is held to a small share of the card. On a
+/// dense model there are no experts to starve, and the only thing the cache can
+/// crowd out is the compute buffers - so the budget is drawn from what is left
+/// after the weights, not from a flat slice of the whole card. Applying the MoE
+/// rule to a dense model is what made a 5.7 GB model load at 32K when it had
+/// room for far more.
+pub fn choose_context(
+    facts_ctx: usize,
+    kv_bytes_per_token: u64,
+    vram_gb: f32,
+    dense_bytes: u64,
+    expert_count: usize,
+) -> usize {
     let ceiling = facts_ctx.max(MIN_CONTEXT);
-    let budget_bytes = (vram_gb * KV_SHARE_OF_VRAM * 1024.0 * 1024.0 * 1024.0) as u64;
+    let vram_bytes = vram_gb as f64 * 1024.0 * 1024.0 * 1024.0;
+
+    let budget_bytes = if expert_count == 0 {
+        // Dense: the weights are already resident, so the cache is competing
+        // only with the compute buffers. Take at most half of what is left,
+        // which leaves room for those buffers and keeps some headroom on the
+        // card instead of filling it to the last byte.
+        let free = (vram_bytes - dense_bytes as f64).max(0.0);
+        (free * DENSE_KV_SHARE_OF_FREE) as u64
+    } else {
+        // MoE: experts need the rest of the card, so the cache keeps to a small
+        // fixed share regardless of how much is free.
+        (vram_bytes * KV_SHARE_OF_VRAM as f64) as u64
+    };
+
     let affordable = if kv_bytes_per_token > 0 {
         (budget_bytes / kv_bytes_per_token) as usize
     } else {
@@ -104,7 +139,13 @@ pub fn plan_for(model_path: &Path, machine: &Machine) -> Result<Choice> {
         (vram_gb as f64 * 1073741824.0) as u64,
         (ram_gb as f64 * 1073741824.0) as u64,
     )?;
-    let ctx = choose_context(probe.facts.context, probe.kv_bytes_per_token, vram_gb);
+    let ctx = choose_context(
+        probe.facts.context,
+        probe.kv_bytes_per_token,
+        vram_gb,
+        probe.dense_bytes,
+        probe.expert_count,
+    );
 
     let solved = Placement::solve(
         model_path,
@@ -295,39 +336,96 @@ mod tests {
 
     /// Ornith-1.5-35B: hybrid attention, so only some layers keep a cache.
     const ORNITH_KV: u64 = 20480;
+    /// Ornith has routed experts, so it takes the MoE path.
+    const ORNITH_EXPERTS: usize = 256 * 41;
+    /// 5.69 GiB of dense weights, which is the model this was reported against.
+    const HERETIC_DENSE: u64 = 6_115_694_112;
 
     #[test]
     fn reproduces_the_context_chosen_by_hand_on_a_16gb_card() {
         // 65536 was arrived at by measurement on the development machine; a
         // rule that disagreed with it would be the wrong rule.
-        assert_eq!(choose_context(262144, ORNITH_KV, 16.0), 65536);
+        assert_eq!(
+            choose_context(262144, ORNITH_KV, 16.0, 3_000_000_000, ORNITH_EXPERTS),
+            65536
+        );
     }
 
     #[test]
     fn smaller_cards_get_smaller_contexts() {
-        assert_eq!(choose_context(262144, ORNITH_KV, 8.0), 32768);
-        assert_eq!(choose_context(262144, ORNITH_KV, 4.0), 16384);
-        assert_eq!(choose_context(262144, ORNITH_KV, 2.0), 8192);
+        for (vram, want) in [(8.0, 32768), (4.0, 16384), (2.0, 8192)] {
+            assert_eq!(
+                choose_context(262144, ORNITH_KV, vram, 1_000_000_000, ORNITH_EXPERTS),
+                want,
+                "{vram} GB"
+            );
+        }
     }
 
     #[test]
     fn a_dense_model_with_a_fat_cache_gets_a_short_context() {
-        // A non-hybrid 70B at 8 bytes/token/layer over 80 layers.
+        // A non-hybrid 70B at 640 KB/token over 80 layers. The weights are 2 GB,
+        // leaving 14 GB, half of which is 7 GB - and 8192 tokens of this cache
+        // is 4.88 GB, so 8192 is the largest rung that fits. The point of the
+        // test is that a fat cache still yields a short window, not that the
+        // dense path is generous with every model.
         let dense_kv = 640_000u64;
-        assert!(choose_context(131072, dense_kv, 16.0) <= 2048);
+        assert_eq!(
+            choose_context(131072, dense_kv, 16.0, 2_000_000_000, 0),
+            8192
+        );
+    }
+
+    /// The reported bug: a 5.7 GB dense model on a 16 GB card was loaded at 32K
+    /// because the MoE rule capped the cache at 10% of the whole card. With no
+    /// experts to protect, the cache should draw on what is left after the
+    /// weights instead.
+    #[test]
+    fn a_dense_model_gets_more_context_than_the_moe_rule_would_allow() {
+        let dense_kv = 32768u64; // 32 KB per token, measured from this model
+        let got = choose_context(262144, dense_kv, 16.0, HERETIC_DENSE, 0);
+        let moe_rule = choose_context(262144, dense_kv, 16.0, HERETIC_DENSE, 1);
+        assert!(
+            got > moe_rule,
+            "dense {got} should beat the MoE rule's {moe_rule}"
+        );
+        // 5.69 GB of weights leaves ~10.3 GB; half of that is ~5.15 GB, which
+        // buys 131072 tokens of cache. It must not pick the 32K the old rule did.
+        assert!(got >= 131072, "expected at least 131072, got {got}");
+    }
+
+    #[test]
+    fn a_dense_model_still_respects_the_card_it_is_on() {
+        let dense_kv = 32768u64;
+        let small = choose_context(262144, dense_kv, 8.0, HERETIC_DENSE, 0);
+        let big = choose_context(262144, dense_kv, 16.0, HERETIC_DENSE, 0);
+        assert!(small < big, "an 8 GB card must not match a 16 GB one");
+    }
+
+    #[test]
+    fn a_dense_model_never_exceeds_its_trained_context() {
+        assert_eq!(choose_context(8192, 32768, 48.0, HERETIC_DENSE, 0), 8192);
     }
 
     #[test]
     fn never_exceeds_what_the_model_was_trained_for() {
-        assert_eq!(choose_context(8192, ORNITH_KV, 48.0), 8192);
-        assert_eq!(choose_context(4096, ORNITH_KV, 96.0), 4096);
+        assert_eq!(
+            choose_context(8192, ORNITH_KV, 48.0, 1_000_000_000, ORNITH_EXPERTS),
+            8192
+        );
+        assert_eq!(
+            choose_context(4096, ORNITH_KV, 96.0, 1_000_000_000, ORNITH_EXPERTS),
+            4096
+        );
     }
 
     #[test]
     fn always_lands_on_the_ladder() {
         for vram in [1.0f32, 3.5, 7.0, 11.0, 24.0, 80.0] {
-            let c = choose_context(262144, ORNITH_KV, vram);
+            let c = choose_context(262144, ORNITH_KV, vram, 1_000_000_000, ORNITH_EXPERTS);
             assert!(LADDER.contains(&c), "{vram} GB gave {c}");
+            let d = choose_context(262144, 32768, vram, HERETIC_DENSE, 0);
+            assert!(LADDER.contains(&d), "dense {vram} GB gave {d}");
         }
     }
 }
