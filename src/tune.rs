@@ -6,7 +6,7 @@
 //! layers run without contention. So measure instead of predict, and write the
 //! answer next to the model for `serve` to pick up.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -269,7 +269,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         flags.ctx = ctx;
 
         let outcome = async {
-            let mut runner = match Runner::start(&path, flags.clone(), PORT) {
+            let mut runner = match Runner::start(&path, flags.clone(), PORT, crate::backend::Backend::LlamaCpp) {
                 Ok(r) => r,
                 Err(e) => {
                     println!("{cpu_moe:>10}  start failed: {e}");
@@ -320,37 +320,84 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         }
 
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 
-        if queue.is_empty() && !refined {
-            refined = true;
-            if let Some((b, _)) = &best {
-                queue = neighbours(b.cpu_moe_layers, layers, &done);
-                if !queue.is_empty() {
-                    println!("{:->60}", "");
+    // --- Placement search over -ot patterns (roadmap item 1) ---
+    // After the cpu-moe sweep, try a handful of -ot regex placements. These
+    // can express non-contiguous expert placement (e.g. only early layers'
+    // experts on the CPU) that -ncmoe cannot. Keep the best if it beats the
+    // sweep winner.
+    let candidate_patterns: Vec<&str> = vec![
+        r"blk\.\d+\.ffn_.*_exps=CPU",
+    ];
+    // Only attempt pattern search if we have a baseline.
+    if best.is_some() {
+        for pat in candidate_patterns {
+            let mut flags = derived.clone();
+            flags.cpu_moe_layers = 0;
+            flags.expert_override = Some(pat.to_string());
+            flags.ctx = ctx;
+
+            let outcome = async {
+                let mut runner = match Runner::start(&path, flags.clone(), PORT, crate::backend::Backend::LlamaCpp) {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                };
+                if runner.wait_ready(Duration::from_secs(600)).await.is_err() {
+                    return None;
+                }
+                let vram_gb = vram_of(runner.pid());
+                let perf = measure(&runner.endpoint).await.ok()?;
+                Some((perf, vram_gb))
+            }
+            .await;
+
+            if let Some((perf, vram_gb)) = outcome {
+                if perf.decode_tok_s > 0.0 && perf.prefill_tok_s > 0.0 {
+                    let turn = perf.turn_seconds();
+                    let cur_turn = best.as_ref().unwrap().1.turn_seconds();
+                    println!(
+                        "pattern {:>28}  {:>10.0}  {:>9.1}  turn {:.1}{}",
+                        pat,
+                        perf.prefill_tok_s,
+                        perf.decode_tok_s,
+                        turn,
+                        if turn < cur_turn { " <-- best" } else { "" }
+                    );
+                    if turn < cur_turn {
+                        let mut t = best.as_ref().unwrap().0.clone();
+                        t.expert_override = Some(pat.to_string());
+                        t.cpu_moe_layers = 0;
+                        t.tok_s = perf.decode_tok_s;
+                        t.prefill_tok_s = perf.prefill_tok_s;
+                        t.turn_s = turn;
+                        t.vram_gb = vram_gb;
+                        best = Some((t, perf));
+                    }
                 }
             }
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
+
+        // Save best.
+        let (best_tuned, _) = best.as_ref().unwrap();
+        if keep {
+            let out = tuned_path(&path, ctx, kv_type.as_deref());
+            std::fs::write(&out, serde_json::to_string_pretty(&best_tuned)?)?;
+            println!("\nSaved to {}", out.display());
+        }
+        println!(
+            "\nBest: cpu-moe {}  pattern {:?}  ->  {:.1} tok/s decode, {:.0} tok/s prefill, turn {:.1}s",
+            best_tuned.cpu_moe_layers,
+            best_tuned.expert_override,
+            best_tuned.tok_s,
+            best_tuned.prefill_tok_s,
+            best_tuned.turn_s
+        );
     }
 
-    let Some((best, perf)) = best else { bail!("no configuration produced tokens") };
-    println!(
-        "\nBest: {} CPU-expert layers — {:.0} tok/s reading, {:.1} tok/s writing, \
-         {:.1}s per turn ({:.2} GB VRAM, KV {})",
-        best.cpu_moe_layers,
-        perf.prefill_tok_s,
-        perf.decode_tok_s,
-        perf.turn_seconds(),
-        best.vram_gb,
-        kv_type.as_deref().unwrap_or("f16")
-    );
-    if keep {
-        let out = tuned_path(&path, ctx, kv_type.as_deref());
-        std::fs::write(&out, serde_json::to_string_pretty(&best)?)
-            .with_context(|| format!("writing {}", out.display()))?;
-        println!("Saved to {} — `strata serve` will use it.", out.display());
-    } else {
-        println!("Not saved (pass --save to keep it).");
-    }
+    let Some((best, _perf)) = best else { bail!("no configuration produced tokens") };
+    let _ = best;
     Ok(())
 }
 

@@ -27,11 +27,22 @@ export interface Scheduler {
 }
 
 export interface Tiers {
+  /** Routed experts placed in each tier. Zero for a dense model. */
   vram: number
   ram: number
   disk: number
+  /** The VRAM and RAM budgets the plan was solved against. */
   vram_gb: number
   ram_gb: number
+  /** Dense weights, KV cache, and the whole file, in GiB. */
+  dense_gb: number
+  kv_gb: number
+  total_gb: number
+  expert_count: number
+  layers: number
+  attention_layers: number
+  /** "placement" when solved from the GGUF, "unknown" under --upstream. */
+  source: "placement" | "unknown"
 }
 
 export interface Hardware {

@@ -94,7 +94,13 @@ function Session({ health }: { health: Health | null }) {
 
   if (!health) return <p className="empty-note">Not connected to the engine.</p>
 
+  // Routed experts, when there are any. A dense model has none, and the meter
+  // would otherwise divide by zero and draw nothing.
   const total = t ? t.vram + t.ram + t.disk : 0
+  const dense = t?.dense_gb ?? 0
+  const kv = t?.kv_gb ?? 0
+  const resident = dense + kv
+  const denseOnly = total === 0
 
   return (
     <>
@@ -136,29 +142,64 @@ function Session({ health }: { health: Health | null }) {
       {t ? (
         <section className="group">
           <h3 className="group-title">Weight placement</h3>
-          <div className="meter" aria-hidden="true">
-            <i style={{ width: `${(100 * t.vram) / (total || 1)}%`, background: "#55a877" }} />
-            <i style={{ width: `${(100 * t.ram) / (total || 1)}%`, background: "#7a7a7a" }} />
-            <i style={{ width: `${(100 * t.disk) / (total || 1)}%`, background: "#3a3a3a" }} />
-          </div>
-          <dl style={{ margin: "10px 0 0" }}>
-            <div className="row">
-              <dt>VRAM</dt>
-              <dd>
-                {t.vram.toLocaleString()} <em>· {gb(t.vram_gb)}</em>
-              </dd>
-            </div>
-            <div className="row">
-              <dt>RAM</dt>
-              <dd>
-                {t.ram.toLocaleString()} <em>· {gb(t.ram_gb)}</em>
-              </dd>
-            </div>
-            <div className="row">
-              <dt>Disk</dt>
-              <dd>{t.disk.toLocaleString()}</dd>
-            </div>
-          </dl>
+          {denseOnly ? (
+            <>
+              {/* No routed experts: this is a dense model, so there is no
+                  expert split to draw. Report what is actually resident. */}
+              <div className="meter" aria-hidden="true">
+                <i style={{ width: "100%", background: "#55a877" }} />
+              </div>
+              <dl style={{ margin: "10px 0 0" }}>
+                <div className="row">
+                  <dt>Dense weights</dt>
+                  <dd>{gb(dense)}</dd>
+                </div>
+                <div className="row">
+                  <dt>KV cache</dt>
+                  <dd>{gb(kv)}</dd>
+                </div>
+                <div className="row">
+                  <dt>Resident</dt>
+                  <dd>
+                    {gb(resident)} <em>of {gb(t.vram_gb)} VRAM</em>
+                  </dd>
+                </div>
+                <div className="row">
+                  <dt>Layers</dt>
+                  <dd>
+                    {t.layers} <em>· {t.attention_layers} keep a KV cache</em>
+                  </dd>
+                </div>
+              </dl>
+              <p className="empty-note" style={{ marginTop: 8 }}>
+                Dense model: no routed experts to place across tiers.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="meter" aria-hidden="true">
+                <i style={{ width: `${(100 * t.vram) / (total || 1)}%`, background: "#55a877" }} />
+                <i style={{ width: `${(100 * t.ram) / (total || 1)}%`, background: "#7a7a7a" }} />
+                <i style={{ width: `${(100 * t.disk) / (total || 1)}%`, background: "#3a3a3a" }} />
+              </div>
+              <dl style={{ margin: "10px 0 0" }}>
+                <div className="row">
+                  <dt>Experts in VRAM</dt>
+                  <dd>
+                    {t.vram.toLocaleString()} <em>of {t.expert_count.toLocaleString()}</em>
+                  </dd>
+                </div>
+                <div className="row">
+                  <dt>Experts in RAM</dt>
+                  <dd>{t.ram.toLocaleString()}</dd>
+                </div>
+                <div className="row">
+                  <dt>Faulted from disk</dt>
+                  <dd>{t.disk.toLocaleString()}</dd>
+                </div>
+              </dl>
+            </>
+          )}
         </section>
       ) : null}
 

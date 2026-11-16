@@ -22,3 +22,6 @@
 
 # pi's project settings - points at a server on this machine
 /.pi
+
+# Perch's own local project state
+/.perch/

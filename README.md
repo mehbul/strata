@@ -319,11 +319,23 @@ point the tool at `http://127.0.0.1:8080/v1` and give it any non-empty key.
 | `setup [--model <m>] [--force] [--dry-run] [--allow-disk]` | detect this machine, choose a context, measure the split |
 | `info` | detected hardware and toolchain |
 | `list` | models on disk, read from their GGUF headers |
+| `models` | installed models as the registry sees them: arch, experts, context, size |
 | `inspect --path <gguf>` | everything a model file declares about itself |
 | `plan --model <m> [--ctx] [--vram] [--ram]` | where the weights would sit |
 | `tune --model <m> [--ctx] [--kv-type T] [--save]` | measure the fastest split on this machine |
 | `pull --model <m>` | fetch a model: an Ollama name, or `owner/repo[:file.gguf]` from Hugging Face |
 | `serve --model <m> [--ctx] [--cpu-moe N] [--no-compact] [--kv-type T] [--api-key K]` | load and serve |
+| `switch --url <u> <model> [--api-key K]` | ask a running server to load a different model |
+| `bench [--url] [--model] [--prompt-tokens N] [--output-tokens N] [--json F]` | measure a running instance: TTFT, prefill, decode |
+| `mcp` | run as an MCP server over stdio |
+
+`serve` also takes `--draft` and `--spec` (speculative decoding), `--mmproj`
+(vision; auto-detected from the model directory when absent), `--devices` and
+`--tensor-split` (multi-GPU), and `--backend auto|llamacpp|niko|poly`.
+
+`switch` reports what the server did with the request. A load that fails is
+rolled back to the model that was already resident, and the error names it, so a
+typosquatted model name does not leave the server with nothing loaded.
 
 Tuning results are stored per context as `tuned-<ctx>.json`, because the KV
 cache reserved at load is VRAM the experts cannot have — a split measured at
@@ -336,10 +348,19 @@ cache reserved at load is VRAM the experts cannot have — a split measured at
 | `GET /v1/models` | model list |
 | `POST /v1/chat/completions` | OpenAI chat, SSE when `stream: true` |
 | `GET /health` | scheduler, model residency, context, tiers, hardware |
+| `GET /metrics` | Prometheus text format: requests, tokens, scheduler, TTFT |
 | `GET /compact` | compaction settings and what it has done |
 | `GET /profile` | per-turn timing |
 | `GET /experts` | expert grid (**simulated**) |
+| `GET /api/models`, `/api/models/current` | installed models, and which is resident |
+| `POST /api/models/load`, `/api/models/unload` | switch the active model, or free the GPU |
 | `POST /model/load`, `POST /model/unload` | free and reclaim the GPU |
+
+`/health` reports `tiers` from the placement solve, not from the simulated
+expert grid, and labels the source. On a dense model `expert_count` is 0 and the
+`vram`/`ram`/`disk` expert counts are all 0 — that is the honest answer, not a
+missing measurement. `dense_gb`, `kv_gb` and `attention_layers` describe what is
+actually resident.
 
 Every completion carries its accounting in the response headers, so a client
 that is not the console can see it:
@@ -426,8 +447,7 @@ untested rather than supported.
 
 ### Why is my GPU not being used?
 
-Run `.
-untime\llama-server.exe --list-devices`. A missing backend library
+Run `.\runtime\llama-server.exe --list-devices`. A missing backend library
 shows up as an empty device list and nothing in the log, so the GPU silently
 disappears and everything falls back to CPU. Strata puts the runtime's own
 library directory and any ROCm redistributables it can find on the loader path
@@ -474,7 +494,8 @@ runtime on the same machine:
 - [ ] Forward pass — for this model a gated-DeltaNet SSM scan plus 256-expert
       routing, which is the hard part
 - [ ] HIP kernels for gfx1102
-- [ ] Real router telemetry, replacing the simulated expert map
+- [ ] Real router telemetry, replacing the simulated expert map (blocked: llama.cpp exposes none; needs a patched compute backend)
+- [ ] Expert-level hot caching (blocked on the above; layer-level `cpu-moe` split ships today)
 
 Expert prefetching is not on this list until the forward pass is: predicting the
 next token's experts requires intercepting a routing decision, and llama.cpp
