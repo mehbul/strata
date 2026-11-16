@@ -30,21 +30,39 @@ impl Runtime {
     /// Look for a usable llama.cpp. `STRATA_LLAMA_DIR` wins; otherwise fall
     /// back to the copy Ollama ships, which is already built for this GPU.
     pub fn discover() -> Option<Self> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Ok(dir) = std::env::var("STRATA_LLAMA_DIR") {
-            roots.push(PathBuf::from(dir));
-        }
-        roots.push(PathBuf::from("runtime"));
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            roots.push(PathBuf::from(local).join("Programs/Ollama/lib/ollama"));
-        }
-        for root in roots {
-            let server = root.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
-            if server.is_file() {
-                return Some(Self { backend: pick_backend(&root), server, lib_dir: root });
+        Self::discover_for(crate::backend::Backend::LlamaCpp)
+    }
+
+    /// Discover a runtime for the given backend. Specialized backends are
+    /// looked up in `runtime/<backend>/`; if absent, returns None so the
+    /// caller can fall back to llama.cpp.
+    pub fn discover_for(backend: crate::backend::Backend) -> Option<Self> {
+        if backend == crate::backend::Backend::LlamaCpp {
+            let mut roots: Vec<PathBuf> = Vec::new();
+            if let Ok(dir) = std::env::var("STRATA_LLAMA_DIR") {
+                roots.push(PathBuf::from(dir));
             }
+            roots.push(PathBuf::from("runtime"));
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                roots.push(PathBuf::from(local).join("Programs/Ollama/lib/ollama"));
+            }
+            for root in roots {
+                let server = root.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
+                if server.is_file() {
+                    return Some(Self { backend: pick_backend(&root), server, lib_dir: root });
+                }
+            }
+            return None;
         }
-        None
+        // Specialized backend: look in runtime/<name>/
+        let root = PathBuf::from("runtime").join(backend.as_str());
+        let bin = backend.binary();
+        let server = root.join(if cfg!(windows) { format!("{}.exe", bin) } else { bin.to_string() });
+        if server.is_file() {
+            Some(Self { backend: None, server, lib_dir: root })
+        } else {
+            None
+        }
     }
 }
 
@@ -105,6 +123,16 @@ pub struct Flags {
     /// `--ctx` it is VRAM the experts cannot have. Halving it buys expert
     /// layers back. Requires flash attention for the V side.
     pub kv_type: Option<String>,
+    /// Speculative decoding draft model (GGUF). None disables speculation.
+    pub draft_model: Option<std::path::PathBuf>,
+    /// Max draft tokens per step.
+    pub spec: Option<usize>,
+    /// Multimodal projector (mmproj) for vision models.
+    pub mmproj: Option<std::path::PathBuf>,
+    /// Devices for multi-GPU (comma list), e.g. "ROCm0,ROCm1".
+    pub devices: Option<String>,
+    /// Tensor split across devices, e.g. "3,1".
+    pub tensor_split: Option<String>,
 }
 
 impl Flags {
@@ -130,6 +158,11 @@ impl Flags {
             threads: std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(6).max(1),
             expert_override: None,
             kv_type: None,
+            draft_model: None,
+            spec: None,
+            mmproj: None,
+            devices: None,
+            tensor_split: None,
         }
     }
 
@@ -192,6 +225,26 @@ impl Flags {
             args.push("-ctv".into());
             args.push(t.clone());
         }
+        if let Some(d) = &self.draft_model {
+            args.push("--model-draft".into());
+            args.push(d.to_string_lossy().into_owned());
+            if let Some(s) = self.spec {
+                args.push("--draft-max".into());
+                args.push(s.to_string());
+            }
+        }
+        if let Some(m) = &self.mmproj {
+            args.push("--mmproj".into());
+            args.push(m.to_string_lossy().into_owned());
+        }
+        if let Some(d) = &self.devices {
+            args.push("-dev".into());
+            args.push(d.clone());
+        }
+        if let Some(t) = &self.tensor_split {
+            args.push("--tensor-split".into());
+            args.push(t.clone());
+        }
         args
     }
 }
@@ -232,10 +285,23 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn start(model: &Path, flags: Flags, port: u16) -> Result<Self> {
-        let runtime = Runtime::discover().context(
-            "no llama.cpp runtime found. Set STRATA_LLAMA_DIR to a directory holding llama-server",
-        )?;
+    pub fn start(model: &Path, flags: Flags, port: u16, backend: crate::backend::Backend) -> Result<Self> {
+        let mut backend = backend;
+        // Resolve: if specialized binary missing, fall back to llama.cpp.
+        let runtime = match crate::runner::Runtime::discover_for(backend) {
+            Some(rt) => rt,
+            None if backend != crate::backend::Backend::LlamaCpp => {
+                println!("  specialized backend {} not found in runtime/{}; falling back to llama.cpp",
+                    backend.as_str(), backend.as_str());
+                backend = crate::backend::Backend::LlamaCpp;
+                crate::runner::Runtime::discover_for(backend).context(
+                    "no llama.cpp runtime found. Set STRATA_LLAMA_DIR to a directory holding llama-server",
+                )?
+            }
+            None => crate::runner::Runtime::discover_for(crate::backend::Backend::LlamaCpp).context(
+                "no llama.cpp runtime found. Set STRATA_LLAMA_DIR to a directory holding llama-server",
+            )?,
+        };
         if !model.is_file() {
             bail!("model file not found: {}", model.display());
         }
@@ -358,6 +424,11 @@ mod tests {
             threads: 6,
             expert_override: None,
             kv_type: None,
+            draft_model: None,
+            spec: None,
+            mmproj: None,
+            devices: None,
+            tensor_split: None,
         }
     }
 

@@ -173,6 +173,18 @@ pub struct Sched {
     cancelled: AtomicU64,
 }
 
+/// Process-wide counters surfaced at GET /metrics (Prometheus text format).
+#[derive(Default)]
+pub struct Metrics {
+    pub requests_total: AtomicU64,
+    pub requests_in_flight: AtomicU64,
+    pub prompt_tokens_total: AtomicU64,
+    pub completion_tokens_total: AtomicU64,
+    pub rejected_total: AtomicU64,
+    pub timed_out_total: AtomicU64,
+    pub cancelled_total: AtomicU64,
+}
+
 // ----------------------------------------------------------------- experts
 
 /// Expert grid backing the brain view. `tier` is fixed by the placement plan,
@@ -277,17 +289,6 @@ impl Experts {
         s
     }
 
-    fn counts(&self) -> (usize, usize, usize) {
-        let mut c = (0usize, 0usize, 0usize);
-        for t in &self.tier {
-            match t {
-                2 => c.0 += 1,
-                1 => c.1 += 1,
-                _ => c.2 += 1,
-            }
-        }
-        c
-    }
 }
 
 // ----------------------------------------------------------------- profile
@@ -307,14 +308,33 @@ pub struct ProfileTurn {
 
 // ------------------------------------------------------------------- state
 
+/// The real placement solve, kept so `/health` can report where the weights
+/// actually went instead of inferring it from the simulated expert grid.
+#[derive(Clone, Copy)]
+pub struct PlacementReport {
+    pub layers: usize,
+    pub attention_layers: usize,
+    pub expert_count: usize,
+    pub vram_experts: usize,
+    pub ram_experts: usize,
+    pub disk_experts: usize,
+    pub dense_gb: f32,
+    pub kv_gb: f32,
+    pub total_gb: f32,
+}
+
 pub struct AppState {
-    model: String,
+    model: std::sync::Mutex<String>,
+    /// `None` under `--upstream`, where Strata did not size the model itself.
+    placement: Option<PlacementReport>,
+    models_root: std::path::PathBuf,
     upstream: String,
     client: reqwest::Client,
     hw: Hw,
     vram_gb: f32,
     ram_gb: f32,
     sched: Sched,
+    metrics: Metrics,
     profile: Mutex<Vec<ProfileTurn>>,
     experts: Mutex<Experts>,
     /// Bounds how many turns run at once. The sidebar advertises `capacity`
@@ -342,6 +362,7 @@ pub struct Compute {
     runner: Option<crate::runner::Runner>,
     model_path: std::path::PathBuf,
     flags: crate::runner::Flags,
+    backend: crate::backend::Backend,
     port: u16,
 }
 
@@ -354,7 +375,7 @@ impl Compute {
         if self.is_loaded() {
             return Ok(std::time::Duration::ZERO);
         }
-        let mut r = crate::runner::Runner::start(&self.model_path, self.flags.clone(), self.port)?;
+        let mut r = crate::runner::Runner::start(&self.model_path, self.flags.clone(), self.port, self.backend)?;
         let took = r.wait_ready(std::time::Duration::from_secs(600)).await?;
         self.runner = Some(r);
         Ok(took)
@@ -403,7 +424,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 pub struct Msg {
     pub role: String,
     #[serde(default, deserialize_with = "message_text")]
-    pub content: String,
+    pub content: Value,
     /// The rest of the message: `tool_calls` on an assistant turn,
     /// `tool_call_id` and `name` on a tool result. Strata reads none of it, but
     /// a coding agent's entire loop is carried in those fields, so they are
@@ -420,11 +441,20 @@ impl Msg {
     /// otherwise every such turn would measure as zero tokens and vanish from
     /// a summary.
     pub fn text(&self) -> String {
+        let base = match &self.content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
         match self.extra.get("tool_calls") {
-            None => self.content.clone(),
-            Some(calls) if self.content.is_empty() => calls.to_string(),
+            None => base,
+            Some(calls) if base.is_empty() => calls.to_string(),
             Some(calls) => format!("{}
-{calls}", self.content),
+{calls}", base),
         }
     }
 }
@@ -433,15 +463,13 @@ impl Msg {
 /// a string, `null` for a turn that is only a tool call, or an array of content
 /// parts; refusing the last two rejects the whole conversation with a
 /// deserialisation error the client cannot act on.
-fn message_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(match Value::deserialize(d)? {
-        Value::String(s) => s,
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
+fn message_text<'de, D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(match v {
+        Value::Null => Value::Null,
+        Value::String(s) => Value::String(s),
+        Value::Array(parts) => Value::Array(parts),
+        other => other,
     })
 }
 
@@ -449,8 +477,33 @@ fn message_text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 
 async fn health(State(state): State<Shared>) -> Json<Value> {
     let (ram_total, ram_avail) = winmem::ram_gb();
-    let (vram_n, ram_n, disk_n) = state.experts.lock().unwrap_or_else(|e| e.into_inner()).counts();
     let s = &state.sched;
+    // Reported from the placement solve, not from the expert grid. The grid is
+    // simulated and pads a dense model to one column per layer, so counting its
+    // cells says 33 experts live on disk when the model has no experts at all.
+    let tiers = match &state.placement {
+        Some(p) => json!({
+            "vram": p.vram_experts,
+            "ram": p.ram_experts,
+            "disk": p.disk_experts,
+            "vram_gb": state.vram_gb,
+            "ram_gb": state.ram_gb,
+            "dense_gb": p.dense_gb,
+            "kv_gb": p.kv_gb,
+            "total_gb": p.total_gb,
+            "expert_count": p.expert_count,
+            "layers": p.layers,
+            "attention_layers": p.attention_layers,
+            "source": "placement",
+        }),
+        None => json!({
+            "vram": 0, "ram": 0, "disk": 0,
+            "vram_gb": state.vram_gb, "ram_gb": state.ram_gb,
+            "dense_gb": 0.0, "kv_gb": 0.0, "total_gb": 0.0,
+            "expert_count": 0, "layers": 0, "attention_layers": 0,
+            "source": "unknown",
+        }),
+    };
     Json(json!({
         "status": "ok",
         "simulated": true,
@@ -466,7 +519,11 @@ async fn health(State(state): State<Shared>) -> Json<Value> {
             "timed_out": s.timed_out.load(Ordering::Relaxed),
             "cancelled": s.cancelled.load(Ordering::Relaxed),
         },
-        "kv_slots": KV_SLOTS,
+        // The compute process is started with `-np 1`: one KV slot, because
+        // every slot splits one shared cache and a turn can then land on a
+        // slot that does not hold the prefix. `scheduler.capacity` is the
+        // separate, larger bound on concurrent turns.
+        "kv_slots": 1,
         "model": {
             // `owned` is false under --upstream, where the process is someone
             // else's and the console should not offer to stop it.
@@ -475,13 +532,10 @@ async fn health(State(state): State<Shared>) -> Json<Value> {
                 Some(c) => c.try_lock().map(|g| g.is_loaded()).unwrap_or(true),
                 None => true,
             },
-            "name": state.model,
+            "name": state.model.lock().unwrap().clone(),
         },
         "compaction": state.compactor.report(),
-        "tiers": {
-            "vram": vram_n, "ram": ram_n, "disk": disk_n,
-            "vram_gb": state.vram_gb, "ram_gb": state.ram_gb,
-        },
+        "tiers": tiers,
         "hwinfo": {
             "cores": state.hw.cores,
             "ram_total_gb": ram_total,
@@ -615,10 +669,44 @@ async fn experts(State(state): State<Shared>) -> Json<Value> {
     }))
 }
 
+/// GET /metrics - Prometheus text format.
+async fn metrics(State(state): State<Shared>) -> String {
+    let m = &state.metrics;
+    let mut out = String::new();
+    out.push_str("# HELP strata_requests_total Total chat completion requests.\n");
+    out.push_str("# TYPE strata_requests_total counter\n");
+    out.push_str(&format!("strata_requests_total {}\n", m.requests_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_requests_in_flight Requests currently in flight.\n");
+    out.push_str("# TYPE strata_requests_in_flight gauge\n");
+    out.push_str(&format!("strata_requests_in_flight {}\n", m.requests_in_flight.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_prompt_tokens_total Total prompt tokens processed.\n");
+    out.push_str("# TYPE strata_prompt_tokens_total counter\n");
+    out.push_str(&format!("strata_prompt_tokens_total {}\n", m.prompt_tokens_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_completion_tokens_total Total completion tokens generated.\n");
+    out.push_str("# TYPE strata_completion_tokens_total counter\n");
+    out.push_str(&format!("strata_completion_tokens_total {}\n", m.completion_tokens_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_rejected_total Rejected requests (upstream unavailable).\n");
+    out.push_str("# TYPE strata_rejected_total counter\n");
+    out.push_str(&format!("strata_rejected_total {}\n", m.rejected_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_timed_out_total Requests that timed out in queue.\n");
+    out.push_str("# TYPE strata_timed_out_total counter\n");
+    out.push_str(&format!("strata_timed_out_total {}\n", m.timed_out_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_cancelled_total Cancelled requests.\n");
+    out.push_str("# TYPE strata_cancelled_total counter\n");
+    out.push_str(&format!("strata_cancelled_total {}\n", m.cancelled_total.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_sched_active Active scheduler slots.\n");
+    out.push_str("# TYPE strata_sched_active gauge\n");
+    out.push_str(&format!("strata_sched_active {}\n", state.sched.active.load(Ordering::Relaxed)));
+    out.push_str("# HELP strata_sched_completed Completed turns.\n");
+    out.push_str("# TYPE strata_sched_completed counter\n");
+    out.push_str(&format!("strata_sched_completed {}\n", state.sched.completed.load(Ordering::Relaxed)));
+    out
+}
+
 /// OpenAI /v1/models - whatever the compute process reports, plus the model
 /// this instance was started with.
 async fn models(State(state): State<Shared>) -> Json<Value> {
-    let mut ids = vec![state.model.clone()];
+    let mut ids = vec![state.model.lock().unwrap().clone()];
     if let Ok(resp) = state.client.get(format!("{}/v1/models", state.upstream)).send().await {
         if let Ok(body) = resp.json::<Value>().await {
             if let Some(list) = body.get("data").and_then(|m| m.as_array()) {
@@ -638,6 +726,140 @@ async fn models(State(state): State<Shared>) -> Json<Value> {
     Json(json!({ "object": "list", "data": data }))
 }
 
+/// GET /api/models - installed models (PolyStrata contract).
+async fn api_models(State(state): State<Shared>) -> Json<Value> {
+    let entries = crate::registry::scan(&state.models_root);
+    let current = state.model.lock().unwrap().clone();
+    let loaded = state
+        .compute
+        .as_ref()
+        .map(|c| {
+            // try_lock to avoid blocking; treat locked as loaded-ish
+            c.try_lock().map(|g| g.is_loaded()).unwrap_or(true)
+        })
+        .unwrap_or(false);
+    let data: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "display_name": e.name,
+                "arch": e.arch,
+                "path": e.path,
+                "experts": e.experts,
+                "experts_used": e.experts_used,
+                "context": e.context,
+                "file_bytes": e.file_bytes,
+                "is_moe": e.is_moe,
+                "current": e.id == current,
+                "loaded": if e.id == current { loaded } else { false },
+            })
+        })
+        .collect();
+    Json(json!({ "models": data, "current": current }))
+}
+
+/// GET /api/models/current
+async fn api_models_current(State(state): State<Shared>) -> Json<Value> {
+    let loaded = state
+        .compute
+        .as_ref()
+        .map(|c| c.try_lock().map(|g| g.is_loaded()).unwrap_or(true))
+        .unwrap_or(false);
+    Json(json!({ "model": state.model.lock().unwrap().clone(), "loaded": loaded }))
+}
+
+#[derive(Deserialize)]
+struct LoadModelReq {
+    model: String,
+}
+
+/// POST /api/models/load { "model": "..." } - switch the active model.
+async fn api_models_load(State(state): State<Shared>, Json(req): Json<LoadModelReq>) -> Response {
+    let new_path = match crate::registry::resolve(&state.models_root, &req.model) {
+        Some(p) => p,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("model not found: {}", req.model)})),
+            )
+                .into_response()
+        }
+    };
+
+    // Wait for in-flight to drain (best effort, up to 30s).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.sched.active.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let Some(compute) = &state.compute else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no compute process (upstream mode)"})),
+        )
+            .into_response();
+    };
+
+    let mut c = compute.lock().await;
+
+    // Remember what was resident, so a failed switch can put it back. A caller
+    // asking to change models did not ask to give the GPU back, and leaving
+    // nothing loaded turns a bad model name into a dead server.
+    let previous_path = c.model_path.clone();
+    let previous_model = state.model.lock().unwrap().clone();
+
+    // Unload current.
+    c.unload();
+    // Swap model path.
+    c.model_path = new_path.clone();
+    // Reload.
+    match c.load().await {
+        Ok(_) => {
+            *state.model.lock().unwrap() = req.model.clone();
+            Json(json!({"ok": true, "model": req.model, "path": new_path})).into_response()
+        }
+        Err(e) => {
+            // Roll back to what was loaded before this request.
+            c.model_path = previous_path.clone();
+            let (status, body) = match c.load().await {
+                Ok(_) => {
+                    *state.model.lock().unwrap() = previous_model.clone();
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "error": format!("failed to load {}: {e}", req.model),
+                            "rolled_back_to": previous_model,
+                            "path": previous_path.to_string_lossy(),
+                        }),
+                    )
+                }
+                Err(rollback_err) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "error": format!("failed to load {}: {e}", req.model),
+                        "rollback_failed": format!("{rollback_err}"),
+                        "note": "no model is loaded",
+                    }),
+                ),
+            };
+            (status, Json(body)).into_response()
+        }
+    }
+}
+
+/// POST /api/models/unload
+async fn api_models_unload(State(state): State<Shared>) -> Json<Value> {
+    if let Some(compute) = &state.compute {
+        if let Ok(mut c) = compute.try_lock() {
+            c.unload();
+        }
+    }
+    Json(json!({"ok": true}))
+}
+
 /// POST /v1/chat/completions - forwards to the compute process Strata started
 /// and streams its OpenAI frames straight through, recording usage in passing.
 ///
@@ -645,12 +867,18 @@ async fn models(State(state): State<Shared>) -> Json<Value> {
 /// if it no longer fits, so a long session degrades into a summary rather than
 /// into a truncated prompt.
 async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>) -> Response {
-    let model = if req.model.is_empty() { state.model.clone() } else { req.model.clone() };
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    state.metrics.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+    let model = if req.model.is_empty() { state.model.lock().unwrap().clone() } else { req.model.clone() };
     let id = format!("chatcmpl-{}", uid());
     let admitted = Instant::now();
     let permit = match admit(&state).await {
         Some(p) => p,
-        None => return queue_full(),
+        None => {
+            state.metrics.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+            state.metrics.timed_out_total.fetch_add(1, Ordering::Relaxed);
+            return queue_full();
+        }
     };
     // `try_lock`, not `lock`: the lock is held for the whole of a load, which
     // reads tens of gigabytes of weights. Waiting on it would park this turn -
@@ -941,6 +1169,7 @@ impl TurnGuard {
         if !self.settled {
             self.settled = true;
             self.shared.sched.rejected.fetch_add(1, Ordering::Relaxed);
+            self.shared.metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -958,6 +1187,9 @@ impl TurnGuard {
         }
         self.settled = true;
         self.shared.sched.completed.fetch_add(1, Ordering::Relaxed);
+
+        self.shared.metrics.prompt_tokens_total.fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.shared.metrics.completion_tokens_total.fetch_add(completion_tokens, Ordering::Relaxed);
 
         let turn = ProfileTurn {
             wall_s: started.elapsed().as_secs_f32(),
@@ -986,8 +1218,10 @@ impl TurnGuard {
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         self.shared.sched.active.fetch_sub(1, Ordering::Relaxed);
+        self.shared.metrics.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
         if !self.settled {
             self.shared.sched.cancelled.fetch_add(1, Ordering::Relaxed);
+            self.shared.metrics.cancelled_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1095,10 +1329,19 @@ pub struct ServeOptions {
     /// Required on every API request when set. Binding anywhere but loopback
     /// without one is refused.
     pub api_key: Option<String>,
+    /// Speculative decoding draft model path.
+    pub draft: Option<String>,
+    /// Max draft tokens per step.
+    pub spec: Option<usize>,
+    /// Multimodal projector path (optional).
+    pub mmproj: Option<String>,
+    pub devices: Option<String>,
+    pub tensor_split: Option<String>,
+    pub backend: Option<String>,
 }
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
-    let ServeOptions { listen, model, ctx, cpu_moe, upstream, compact, kv_type, api_key } = opts;
+    let ServeOptions { listen, model, ctx, cpu_moe, upstream, compact, kv_type, api_key, draft, spec, mmproj, devices, tensor_split, backend } = opts;
 
     // A public address with no key hands the GPU to anything that can reach the
     // port. Refusing is the only safe default; loopback stays open because
@@ -1130,6 +1373,26 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         None => (0, 0, 1, 0.0, 0.0),
     };
 
+    // Backend selection: auto by architecture, or explicit override.
+    let arch = placed.as_ref().map(|p| p.facts.arch.clone()).unwrap_or_default();
+    let mut selected_backend = match backend.as_deref() {
+        Some("niko") => crate::backend::Backend::StrataNiko,
+        Some("poly") => crate::backend::Backend::StrataPoly,
+        Some("llamacpp") | Some("llama") => crate::backend::Backend::LlamaCpp,
+        _ => crate::backend::select(&arch),
+    };
+    if selected_backend != crate::backend::Backend::LlamaCpp
+        && crate::runner::Runtime::discover_for(selected_backend).is_none()
+    {
+        println!(
+            "  backend {} not found in runtime/{}; falling back to llama.cpp",
+            selected_backend.as_str(),
+            selected_backend.as_str()
+        );
+        selected_backend = crate::backend::Backend::LlamaCpp;
+    }
+    println!("  backend  {}", selected_backend.as_str());
+
     // Start the compute process ourselves unless told to use an existing one.
     let mut compute: Option<tokio::sync::Mutex<Compute>> = None;
     let endpoint = match (upstream, &path, &placed) {
@@ -1140,6 +1403,31 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         (None, Some(model_path), Some(p)) => {
             let mut flags = crate::runner::Flags::derive(p);
             flags.kv_type = kv_type.clone();
+            flags.draft_model = draft.as_ref().map(std::path::PathBuf::from);
+            flags.spec = spec;
+            flags.mmproj = mmproj.as_ref().map(std::path::PathBuf::from);
+            flags.devices = devices.clone();
+            flags.tensor_split = tensor_split.clone();
+            // Auto-detect mmproj if not given.
+            if flags.mmproj.is_none() {
+                if let Some(p) = &placed {
+                    let _ = p;
+                }
+                let model_dir = std::path::Path::new(&model).parent().unwrap_or(std::path::Path::new("."));
+                // model is a name, not path; search rocm/models/<model>
+                let dir = std::path::PathBuf::from("rocm/models").join(&model);
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let n = e.file_name();
+                        let ns = n.to_string_lossy();
+                        if ns.contains("mmproj") && ns.ends_with(".gguf") {
+                            flags.mmproj = Some(e.path());
+                            break;
+                        }
+                    }
+                }
+                let _ = model_dir;
+            }
             let mut source = "derived";
             if let Some(t) = crate::tune::load(model_path, ctx, kv_type.as_deref()) {
                 flags.cpu_moe_layers = t.cpu_moe_layers;
@@ -1167,7 +1455,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             if let Some(pattern) = &flags.expert_override {
                 println!("  placement {pattern}");
             }
-            let mut r = crate::runner::Runner::start(model_path, flags.clone(), 8099)?;
+            let mut r = crate::runner::Runner::start(model_path, flags.clone(), 8099, selected_backend)?;
             println!("  runtime {}", r.runtime.server.display());
             if let Some(b) = &r.runtime.backend {
                 println!("  backend {}", b.display());
@@ -1181,6 +1469,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 runner: Some(r),
                 model_path: model_path.clone(),
                 flags,
+                backend: selected_backend,
                 port: 8099,
             }));
             url
@@ -1221,16 +1510,29 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     println!("  NOTE: the expert map in /experts is SIMULATED; the router is not observable yet.");
 
     let state: Shared = Arc::new(AppState {
-        model: model.clone(),
+        model: std::sync::Mutex::new(model.clone()),
+        models_root: crate::registry::default_root(),
         api_key: api_key.clone(),
         compute,
         compactor,
         upstream: endpoint,
         client,
+        placement: placed.as_ref().map(|p| PlacementReport {
+            layers: p.facts.layers,
+            attention_layers: p.attention_layers,
+            expert_count: p.expert_count,
+            vram_experts: p.vram_experts,
+            ram_experts: p.ram_experts,
+            disk_experts: p.disk_experts,
+            dense_gb: p.dense_bytes as f32 / 1073741824.0,
+            kv_gb: p.kv_bytes as f32 / 1073741824.0,
+            total_gb: p.total_weight_bytes as f32 / 1073741824.0,
+        }),
         hw: probe_hw(),
         vram_gb: placed.as_ref().map(|p| p.vram_budget as f32 / 1073741824.0).unwrap_or(0.0),
         ram_gb: placed.as_ref().map(|p| p.ram_budget as f32 / 1073741824.0).unwrap_or(0.0),
         sched: Sched::default(),
+        metrics: Metrics::default(),
         permits: Arc::new(tokio::sync::Semaphore::new(KV_SLOTS)),
         profile: Mutex::new(Vec::new()),
         experts: Mutex::new(Experts::new(layers, n_experts, top_k, vram_frac, ram_frac)),
@@ -1246,10 +1548,16 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .route("/profile", get(profile))
         .route("/v1/profile", get(profile))
         .route("/experts", get(experts))
+        .route("/metrics", get(metrics))
+        .route("/v1/metrics", get(metrics))
         .route("/compact", get(compaction))
         .route("/v1/compact", get(compaction))
         .route("/model/load", post(load_model))
         .route("/model/unload", post(unload_model))
+        .route("/api/models", get(api_models))
+        .route("/api/models/current", get(api_models_current))
+        .route("/api/models/load", post(api_models_load))
+        .route("/api/models/unload", post(api_models_unload))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_key))

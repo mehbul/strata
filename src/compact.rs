@@ -191,7 +191,7 @@ impl Compactor {
         let started = Instant::now();
         let head_len = messages.iter().take_while(|m| m.role == "system").count();
         let (system_base, prior) = if head_len > 0 {
-            split_marker(&messages[head_len - 1].content)
+            split_marker(&messages[head_len - 1].text())
         } else {
             (String::new(), None)
         };
@@ -240,7 +240,7 @@ impl Compactor {
 
         let mut out: Vec<Msg> = Vec::with_capacity(head_len + 1 + messages.len() - start);
         out.extend(messages[..head_len.saturating_sub(1)].iter().cloned());
-        out.push(Msg { role: "system".into(), content: system, ..Default::default() });
+        out.push(Msg { role: "system".into(), content: serde_json::Value::String(system), ..Default::default() });
         out.extend(messages[start..].iter().cloned());
 
         let after: usize = self.measure(&out).await.iter().sum();
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> Msg {
-        Msg { role: role.into(), content: content.into(), ..Default::default() }
+        Msg { role: role.into(), content: serde_json::Value::String(content.to_string()), ..Default::default() }
     }
 
     #[test]

@@ -1,11 +1,15 @@
 //! Strata — a local inference engine for mixture-of-experts models on ROCm.
 
 mod compact;
+mod bench;
 mod hardware;
+mod backend;
+mod mcp;
 mod expert;
 mod gguf;
 mod hub;
 mod placement;
+mod registry;
 mod rocm;
 mod runner;
 mod setup;
@@ -45,6 +49,19 @@ enum Commands {
     Info,
     /// Models present on disk, read from their GGUF headers
     List,
+    /// Installed models (registry view)
+    Models,
+    /// Ask a running server to load a different model
+    Switch {
+        /// Base URL of a running Strata instance
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        /// Model name or path, as `strata models` lists it
+        model: String,
+        /// API key, when the server requires one. Also read from STRATA_API_KEY
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Everything a GGUF file declares about itself
     Inspect {
         #[arg(long)]
@@ -108,7 +125,41 @@ enum Commands {
         /// not a loopback address. Also read from STRATA_API_KEY
         #[arg(long)]
         api_key: Option<String>,
+        /// Speculative decoding draft model (GGUF). Off by default; there is
+        /// no automatic selection yet, so name the draft model explicitly.
+        #[arg(long)]
+        draft: Option<String>,
+        /// Max draft tokens per speculation step.
+        #[arg(long)]
+        spec: Option<usize>,
+        /// Multimodal projector (mmproj) GGUF for vision models.
+        #[arg(long)]
+        mmproj: Option<String>,
+        /// Devices for multi-GPU (comma list).
+        #[arg(long)]
+        devices: Option<String>,
+        /// Tensor split across devices.
+        #[arg(long)]
+        tensor_split: Option<String>,
+        /// Compute backend: auto (default), llamacpp, niko, poly.
+        #[arg(long, default_value = "auto")]
+        backend: Option<String>,
     },
+    /// Run as an MCP server over stdio
+    Mcp,
+    /// Benchmark a running instance
+    Bench {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 2048)]
+        prompt_tokens: usize,
+        #[arg(long, default_value_t = 256)]
+        output_tokens: usize,
+        #[arg(long)]
+        json: Option<String>,
+}
 }
 
 #[tokio::main]
@@ -122,6 +173,25 @@ async fn main() -> Result<()> {
         }
         Commands::Info => rocm::print_info()?,
         Commands::List => placement::list_local()?,
+        Commands::Models => {
+            let entries = registry::scan(&registry::default_root());
+            for e in entries {
+                println!(
+                    "{}  {}  {} experts (top-{})  ctx {}  {:.1} GiB{}",
+                    e.id,
+                    e.arch,
+                    e.experts,
+                    e.experts_used,
+                    e.context,
+                    e.file_bytes as f64 / 1073741824.0,
+                    if e.is_moe { "  [MoE]" } else { "" }
+                );
+            }
+        }
+        Commands::Switch { url, model, api_key } => {
+            let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
+            registry::switch(&url, &model, api_key.as_deref()).await?
+        }
         Commands::Inspect { path } => gguf::inspect(&path)?,
         Commands::Plan { model, ctx, vram, ram } => {
             let vram = vram.unwrap_or_else(rocm::vram_total_gb);
@@ -133,7 +203,20 @@ async fn main() -> Result<()> {
         Commands::Tune { model, ctx, kv_type, save } => {
             tune::run(&model, ctx, kv_type, save).await?
         }
-        Commands::Serve { listen, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key } => {
+        Commands::Bench { url, model, prompt_tokens, output_tokens, json } => {
+            bench::run(bench::BenchArgs {
+                url,
+                model,
+                prompt_tokens,
+                output_tokens,
+                json,
+            })
+            .await?
+        }
+        Commands::Mcp => {
+            mcp::run().await?
+        }
+        Commands::Serve { listen, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key, draft, spec, mmproj, devices, tensor_split, backend } => {
             server::serve(server::ServeOptions {
                 listen,
                 model,
@@ -145,9 +228,16 @@ async fn main() -> Result<()> {
                 api_key: api_key
                     .or_else(|| std::env::var("STRATA_API_KEY").ok())
                     .filter(|k| !k.trim().is_empty()),
+                draft,
+                spec,
+                mmproj,
+                devices,
+                tensor_split,
+                backend,
             })
             .await?
         }
     }
     Ok(())
 }
+
