@@ -1721,6 +1721,17 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .route("/api/models/unload", post(api_models_unload))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        // Harness compatibility. Claude Code speaks the Anthropic Messages API
+        // and Ollama's native clients speak /api/*; neither falls back when the
+        // endpoint answers in the wrong shape, so both dialects are served here
+        // rather than left to the caller to proxy.
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/api/chat", post(ollama_chat))
+        .route("/api/generate", post(ollama_generate))
+        .route("/api/tags", get(ollama_tags))
+        .route("/api/ps", get(ollama_ps))
+        .route("/api/show", post(ollama_show))
+        .route("/api/version", get(ollama_version))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_key,
@@ -1854,4 +1865,303 @@ mod access_tests {
         assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
         assert_ne!(key, suggest_key(), "two suggestions should differ");
     }
+}
+
+// ------------------------------------------------- harness compatibility
+//
+// Strata's own API is OpenAI-shaped, which covers most harnesses but not all.
+// Ollama's native clients and Claude Code's Anthropic client each speak their
+// own dialect, and neither falls back when the endpoint answers in the wrong
+// shape. These handlers translate on the way in and out so one compute process
+// serves all three, which is the whole point of being a drop-in local engine.
+
+/// POST /v1/messages - the Anthropic Messages API, for Claude Code and friends.
+async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let model = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let body = match crate::anthropic::request_to_openai(&req) {
+        Ok(b) => b,
+        Err(e) => return anthropic_error(400, &format!("invalid request: {e}")),
+    };
+
+    let resp = match state
+        .client
+        .post(format!("{}/v1/chat/completions", state.upstream))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => return anthropic_error(502, &format!("compute process returned {}", r.status())),
+        Err(e) => return anthropic_error(502, &format!("cannot reach compute process ({e})")),
+    };
+
+    if !stream {
+        let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        return Json(crate::anthropic::response_to_anthropic(&body, &model)).into_response();
+    }
+
+    // Streaming: OpenAI deltas in, Anthropic SSE events out. The framing differs
+    // enough that this cannot be a pass-through - Anthropic brackets every block
+    // with start/stop events and reports the stop reason at the end.
+    let mut translator = crate::anthropic::StreamTranslator::new(&model);
+    let mut inner = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buf = String::new();
+        loop {
+            let Some(chunk) = inner.next().await else { break };
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                        for (name, data) in translator.push(&v) {
+                            yield Ok::<Event, Infallible>(
+                                Event::default().event(name).data(data.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (name, data) in translator.finish() {
+            yield Ok(Event::default().event(name).data(data.to_string()));
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn anthropic_error(status: u16, message: &str) -> Response {
+    let code = axum::http::StatusCode::from_u16(status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        code,
+        Json(json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/chat - Ollama's native chat API.
+async fn ollama_chat(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    ollama_forward(state, req, true).await
+}
+
+/// POST /api/generate - Ollama's native completion API.
+async fn ollama_generate(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    ollama_forward(state, req, false).await
+}
+
+/// Shared path for both Ollama endpoints: translate, forward, translate back.
+async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
+    let model = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let body = match if chat {
+        crate::ollama::chat_to_openai(&req)
+    } else {
+        crate::ollama::generate_to_openai(&req)
+    } {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid request: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let resp = match state
+        .client
+        .post(format!("{}/v1/chat/completions", state.upstream))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("compute process returned {}", r.status()) })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("cannot reach compute process ({e})") })),
+            )
+                .into_response()
+        }
+    };
+
+    if !stream {
+        let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        let choice = body
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first());
+        let message = choice
+            .and_then(|c| c.get("message"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let finish = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("stop");
+        let usage = body.get("usage").cloned().unwrap_or_else(|| json!({}));
+        return Json(crate::ollama::complete(
+            &model, chat, &message, finish, &usage,
+        ))
+        .into_response();
+    }
+
+    // Ollama streams newline-delimited JSON, not SSE. Each line is one object.
+    let mut inner = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buf = String::new();
+        let mut usage = json!({});
+        let mut finish = "stop".to_string();
+        loop {
+            let Some(chunk) = inner.next().await else { break };
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" {
+                        continue;
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                        continue;
+                    };
+                    if let Some(u) = v.get("usage") {
+                        if u.get("completion_tokens").is_some() {
+                            usage = u.clone();
+                        }
+                    }
+                    let Some(choice) = v
+                        .get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| c.first())
+                    else {
+                        continue;
+                    };
+                    if let Some(r) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        finish = r.to_string();
+                    }
+                    if let Some(delta) = choice.get("delta") {
+                        let out = if chat {
+                            crate::ollama::chat_chunk(delta, &model, false)
+                        } else {
+                            crate::ollama::generate_chunk(delta, &model, false)
+                        };
+                        yield Ok::<_, Infallible>(
+                            Event::default().data(format!("{out}\n")),
+                        );
+                    }
+                }
+            }
+        }
+        let last = crate::ollama::final_chunk(&model, chat, &finish, &usage);
+        yield Ok(Event::default().data(format!("{last}\n")));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// GET /api/tags - the model list Ollama clients expect.
+async fn ollama_tags(State(state): State<Shared>) -> Json<Value> {
+    let entries = crate::registry::scan(&state.models_root);
+    let models: Vec<Value> = entries
+        .iter()
+        .map(|e| crate::ollama::tag_entry(&e.id, &e.arch, e.file_bytes, e.context, e.is_moe))
+        .collect();
+    Json(json!({ "models": models }))
+}
+
+/// GET /api/version - some clients probe this before anything else.
+async fn ollama_version() -> Json<Value> {
+    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// GET /api/ps - what is loaded right now.
+async fn ollama_ps(State(state): State<Shared>) -> Json<Value> {
+    let current = state.model.lock().unwrap().clone();
+    let loaded = state
+        .compute
+        .as_ref()
+        .map(|c| c.try_lock().map(|g| g.is_loaded()).unwrap_or(true))
+        .unwrap_or(false);
+    if !loaded {
+        return Json(json!({ "models": [] }));
+    }
+    let entries = crate::registry::scan(&state.models_root);
+    let entry = entries.iter().find(|e| e.id == current);
+    let size = entry.map(|e| e.file_bytes).unwrap_or(0);
+    Json(json!({
+        "models": [{
+            "name": current,
+            "model": current,
+            "size": size,
+            "digest": "strata",
+            "details": { "format": "gguf", "family": entry.map(|e| e.arch.clone()).unwrap_or_default() },
+        }]
+    }))
+}
+
+/// POST /api/show - what a model file declares about itself.
+async fn ollama_show(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let name = req.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let entries = crate::registry::scan(&state.models_root);
+    let Some(e) = entries.iter().find(|x| x.id == name) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model '{name}' not found") })),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "details": {
+            "format": "gguf",
+            "family": e.arch,
+            "parameter_size": if e.is_moe { "MoE" } else { "dense" },
+        },
+        "model_info": {
+            "general.architecture": e.arch,
+            "strata.expert_count": e.experts,
+            "strata.expert_used": e.experts_used,
+            "strata.context_length": e.context,
+            "strata.file_bytes": e.file_bytes,
+        },
+        "capabilities": ["completion", "tools"],
+    }))
+    .into_response()
 }

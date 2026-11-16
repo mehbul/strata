@@ -1,5 +1,6 @@
 //! Strata — a local inference engine for mixture-of-experts models on ROCm.
 
+mod anthropic;
 mod backend;
 mod bench;
 mod compact;
@@ -8,6 +9,7 @@ mod gguf;
 mod hardware;
 mod hub;
 mod mcp;
+mod ollama;
 mod placement;
 mod registry;
 mod rocm;
