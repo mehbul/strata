@@ -167,6 +167,9 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   copying, deleting, pulling, pushing, creating from a Modelfile and embedding.
   The composer now controls think, reasoning effort, response format and
   keep-alive per request.
+- Final completion pass: DONE — TLS via `STRATA_TLS_CERT`/`STRATA_TLS_KEY`,
+  shell completions, Windows logon task, `export`/`import` bundles, upload
+  timeout, `/api/keys`, schema validation marker, extra install flags.
 - API/model polish pass: DONE — `/api/connect` remote endpoints, cached-token
   accounting, `vram` and chat `context` fields, authenticated registry pulls,
   upstream retry/backoff, structured-layer push, LoRA adapter and `--embeddings`

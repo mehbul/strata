@@ -1398,7 +1398,13 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
     let mut request = state
         .client
         .post(format!("{upstream}/v1/chat/completions"))
-        .json(&body);
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            std::env::var("STRATA_UPSTREAM_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
+        ));
     if let Some(key) = connection_key_for_url(&upstream) {
         request = request.bearer_auth(key);
     }
@@ -2229,6 +2235,35 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         api
     };
 
+    let tls_cert = std::env::var("STRATA_TLS_CERT").ok();
+    let tls_key = std::env::var("STRATA_TLS_KEY").ok();
+    if tls_cert.is_some() != tls_key.is_some() {
+        anyhow::bail!("set both STRATA_TLS_CERT and STRATA_TLS_KEY, or neither");
+    }
+    if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?;
+        let addr: std::net::SocketAddr = listen.parse()?;
+        println!("  TLS        https://{listen}");
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            wait_for_signal().await;
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+        });
+        axum_server::bind_rustls(addr, config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+        if let Some(compute) = &shutdown_state.compute {
+            if let Ok(mut c) = compute.try_lock() {
+                c.unload();
+            }
+        }
+        return Ok(());
+    }
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
 
     // Ctrl+C and the window's close button terminate the process without
@@ -2531,7 +2566,13 @@ async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>)
     let mut request = state
         .client
         .post(format!("{upstream}/v1/chat/completions"))
-        .json(&body);
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            std::env::var("STRATA_UPSTREAM_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
+        ));
     if let Some(key) = connection_key_for_url(&upstream) {
         request = request.bearer_auth(key);
     }
@@ -2658,7 +2699,13 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
     let mut request = state
         .client
         .post(format!("{upstream}/v1/chat/completions"))
-        .json(&body);
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(
+            std::env::var("STRATA_UPSTREAM_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
+        ));
     if let Some(key) = connection_key_for_url(&upstream) {
         request = request.bearer_auth(key);
     }

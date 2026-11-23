@@ -289,6 +289,11 @@ pub fn copy(root: &Path, from: &str, to: &str) -> anyhow::Result<()> {
             continue;
         }
         let dst = dst_dir.join(entry.file_name());
+        println!(
+            "copying {} ({:.1} MB)",
+            dst.file_name().unwrap_or_default().to_string_lossy(),
+            entry.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0)
+        );
         if std::fs::hard_link(entry.path(), &dst).is_err() {
             std::fs::copy(entry.path(), &dst)?;
         }

@@ -41,6 +41,37 @@ pub fn split(input: &str, parts: usize, output: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn export_bundle(model: &str, output: &str) -> Result<()> {
+    let root = crate::registry::default_root();
+    let dir = root.join(crate::registry::safe_name(model)?);
+    if !dir.exists() {
+        bail!("model '{model}' not found");
+    }
+    let status = Command::new("tar")
+        .args([
+            "-czf", output,
+            "-C", root.to_str().unwrap_or("."),
+            dir.file_name().unwrap_or_default().to_str().unwrap_or("."),
+        ])
+        .status()
+        .with_context(|| "running tar")?;
+    if !status.success() { bail!("tar export failed") }
+    println!("wrote {output}");
+    Ok(())
+}
+
+pub fn import_bundle(input: &str) -> Result<()> {
+    let root = crate::registry::default_root();
+    std::fs::create_dir_all(&root)?;
+    let status = Command::new("tar")
+        .args(["-xzf", input, "-C", root.to_str().unwrap_or(".")])
+        .status()
+        .with_context(|| "running tar")?;
+    if !status.success() { bail!("tar import failed") }
+    println!("imported {input}");
+    Ok(())
+}
+
 pub fn merge(input: &str, output: &str) -> Result<()> {
     let exe = binary("llama-gguf-split.exe")?;
     let status = Command::new(exe)

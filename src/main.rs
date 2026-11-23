@@ -36,7 +36,7 @@ mod tokenizer;
 mod updater;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 use tracing_subscriber::EnvFilter;
 
@@ -282,6 +282,21 @@ enum Commands {
         model_flag: Option<String>,
         #[arg(long)]
         purge: bool,
+        /// Keep shared blobs (the default; explicit for scripts)
+        #[arg(long)]
+        keep_blobs: bool,
+    },
+    /// Export a model, its config and tags as a .tar.gz bundle
+    Export {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        out: String,
+    },
+    /// Import a model bundle
+    Import {
+        #[arg(long)]
+        file: String,
     },
     /// Quantize a GGUF with the bundled llama.cpp tool
     Quantize {
@@ -383,6 +398,8 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
         #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
         model: String,
         #[arg(long, default_value_t = default_ctx())]
         ctx: usize,
@@ -412,10 +429,28 @@ enum Commands {
         #[arg(long)]
         embeddings: bool,
     },
+    /// Install or remove the logon-time background task
+    Service {
+        #[arg(long)]
+        install: bool,
+        #[arg(long)]
+        uninstall: bool,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+    },
     /// Control the background server (start / stop / status)
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
+    },
+    /// Print a shell completion script
+    Completion {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Read or write a value in ~/.strata/config.toml
     Config {
@@ -674,17 +709,19 @@ async fn main() -> Result<()> {
             registry::copy(&registry::default_root(), &source, &destination)?;
             println!("copied {source} -> {destination}");
         }
-        Commands::Rm { model, model_flag, purge } => {
+        Commands::Rm { model, model_flag, purge, keep_blobs } => {
             let name = either(model, model_flag, "model")?;
             registry::remove(&registry::default_root(), &name)?;
             println!("removed {name}");
-            if purge {
+            if purge && !keep_blobs {
                 for path in blob::unreferenced(&registry::default_root()) {
                     std::fs::remove_file(&path)?;
                     println!("purged {}", path.display());
                 }
             }
         }
+        Commands::Export { model, out } => tools::export_bundle(&model, &out)?,
+        Commands::Import { file } => tools::import_bundle(&file)?,
         Commands::Quantize { input, output, kind } => tools::quantize(&input, &output, &kind)?,
         Commands::Split { input, output, parts } => tools::split(&input, parts, &output)?,
         Commands::Merge { input, output } => tools::merge(&input, &output)?,
@@ -761,6 +798,22 @@ async fn main() -> Result<()> {
         Commands::Bench { url, model, prompt_tokens, output_tokens, json, compare } => {
             bench::run(bench::BenchArgs { url, model, prompt_tokens, output_tokens, json, compare }).await?
         }
+        Commands::Service { install, uninstall, listen, model, ctx } => {
+            if uninstall {
+                daemon::service_uninstall()?;
+            } else if install {
+                let model = match model {
+                    Some(m) => m,
+                    None => registry::scan(&registry::default_root())
+                        .first()
+                        .map(|e| e.id.clone())
+                        .context("no models installed")?,
+                };
+                daemon::service_install(&listen, &model, ctx)?;
+            } else {
+                println!("use --install or --uninstall");
+            }
+        }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { listen, model, ctx } => {
                 let model = match model {
@@ -775,6 +828,11 @@ async fn main() -> Result<()> {
             DaemonAction::Stop => daemon::stop("127.0.0.1:8080")?,
             DaemonAction::Status { listen } => daemon::status(&listen).await?,
         },
+        Commands::Completion { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        }
         Commands::Config { key, value } => {
             let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))?;
             let dir = std::path::Path::new(&home).join(".strata");
@@ -807,9 +865,17 @@ async fn main() -> Result<()> {
         Commands::Update { stash } => updater::run(stash)?,
         Commands::Mcp => mcp::run().await?,
         Commands::Serve {
-            listen, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key,
+            listen, port, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key,
             draft, spec, mmproj, devices, tensor_split, backend, embeddings,
         } => {
+            let listen = match port {
+                Some(p) => format!(
+                    "{}:{}",
+                    listen.rsplit_once(':').map(|x| x.0).unwrap_or("127.0.0.1"),
+                    p
+                ),
+                None => listen,
+            };
             server::serve(server::ServeOptions {
                 listen, model, ctx, cpu_moe, upstream,
                 compact: !no_compact,

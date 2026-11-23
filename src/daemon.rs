@@ -127,6 +127,33 @@ pub fn stop(listen: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let command = format!(
+        "\"{}\" daemon start --listen {} --model {} --ctx {}",
+        exe.display(), listen, model, ctx
+    );
+    let out = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", "Strata", "/TR", &command, "/SC", "ONLOGON", "/F",
+        ])
+        .output()?;
+    if !out.status.success() {
+        bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    println!("Installed logon task 'Strata' for {model} on http://{listen}");
+    Ok(())
+}
+
+pub fn service_uninstall() -> Result<()> {
+    let out = Command::new("schtasks").args(["/Delete", "/TN", "Strata", "/F"]).output()?;
+    if !out.status.success() {
+        bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    println!("Removed logon task 'Strata'.");
+    Ok(())
+}
+
 pub async fn status(listen: &str) -> Result<()> {
     match read_pid() {
         Some(pid) => println!(
