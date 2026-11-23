@@ -173,6 +173,12 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   daemon watchdog with logon tasks, web metric meter, TLS crypto provider fix,
   wider safetensors metadata, and more route tests. TLS verified with HTTPS
   curl against a self-signed certificate; raw/suffix verified live.
+- Final audit items: DONE — converter now emits tokenizer arrays from
+  `tokenizer.json` and normalises llama-style architectures; POST/validation
+  route tests added; tray process launch and device-code flow verified against
+  a local mock; a real Windows SCM service is available via
+  `strata service-windows --install` (requires Administrator). Tray icon itself
+  cannot be visually verified in a headless session.
 - Final fidelity pass: DONE — Ollama endpoints now stream raw NDJSON, default
   keep-alive is 5m, empty prompts implement load/unload, more Ollama options
   are mapped, generate accepts images, reasoning streams in `message.thinking`,
@@ -216,8 +222,8 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   context token ids, `projector_info`, numeric `model_info`, GGUF licence in
   `show --license`, Ollama-style `list`/`ps`, local tokenizer for compaction,
   conversation `/save`/`/load` in `run`, and MCP embed/version/details tools.
-- Not built: ollama.com device-code sign-in (not needed for a private local
-  install), real router telemetry (llama.cpp exposes no activations), the
+- Not built: real router telemetry (llama.cpp exposes no activations), the
   forward pass (gated-DeltaNet SSM scan + 256-expert routing) and HIP kernels
   (both are a separate engine project, not a missing Strata feature). Push
-  talks Docker Registry v2 and needs a token.
+  talks Docker Registry v2 and needs a token. Device-code sign-in is built via
+  `strata signin --device` with configurable OAuth endpoints.

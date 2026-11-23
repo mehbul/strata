@@ -2515,6 +2515,52 @@ mod http_tests {
     }
 
     #[tokio::test]
+    async fn post_endpoints_cover_validation_and_error_paths() {
+        let app = Router::new()
+            .route("/api/show", post(ollama_show))
+            .route("/api/create", post(ollama_create))
+            .route("/api/delete", delete(ollama_delete))
+            .route("/api/connect", post(api_connect).delete(api_disconnect))
+            .route("/api/keys", get(api_keys_list).post(api_keys_add))
+            .route("/api/blobs/:digest", head(blob_head).post(blob_post))
+            .with_state(test_state());
+
+        let cases = [
+            ("/api/show", "POST", r#"{"model":"missing"}"#, 404),
+            ("/api/create", "POST", r#"{"model":"x"}"#, 400),
+            ("/api/delete", "DELETE", r#"{"model":"missing"}"#, 404),
+        ];
+        for (path, method, body, status) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), status, "{path}");
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/api/blobs/sha256:bad")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn health_endpoint_admits_it_is_simulated() {
         let app = Router::new()
             .route("/health", get(health))

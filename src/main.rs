@@ -33,6 +33,7 @@ mod server;
 mod setup;
 mod tools;
 mod tray;
+mod winservice;
 mod tune;
 mod tokenizer;
 mod updater;
@@ -100,6 +101,9 @@ fn either(positional: Option<String>, flag: Option<String>, what: &str) -> Resul
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Internal: run as a Windows service
+    #[arg(long, hide = true)]
+    service_run: bool,
     /// Print timing information for each response
     #[arg(long, global = true)]
     verbose: bool,
@@ -464,6 +468,19 @@ enum Commands {
         #[arg(long, default_value_t = 8192)]
         ctx: usize,
     },
+    /// Install or remove a real Windows service for the engine
+    ServiceWindows {
+        #[arg(long)]
+        install: bool,
+        #[arg(long)]
+        uninstall: bool,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+    },
     /// Run a system-tray controller for the background server
     Tray {
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -534,6 +551,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
+    if cli.service_run {
+        let listen = std::env::var("STRATA_SERVICE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
+        let model = std::env::var("STRATA_SERVICE_MODEL").unwrap_or_default();
+        let ctx: usize = std::env::var("STRATA_SERVICE_CTX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8192);
+        return winservice::run_service(listen, model, ctx);
+    }
     let nowordwrap = cli.nowordwrap;
     let verbose = cli.verbose;
     let host = cli.host.unwrap_or_else(default_host);
@@ -859,6 +885,22 @@ async fn main() -> Result<()> {
                         .context("no models installed")?,
                 };
                 daemon::service_install(&listen, &model, ctx)?;
+            } else {
+                println!("use --install or --uninstall");
+            }
+        }
+        Commands::ServiceWindows { install, uninstall, listen, model, ctx } => {
+            if uninstall {
+                winservice::uninstall()?;
+            } else if install {
+                let model = match model {
+                    Some(m) => m,
+                    None => registry::scan(&registry::default_root())
+                        .first()
+                        .map(|e| e.id.clone())
+                        .context("no models installed")?,
+                };
+                winservice::install(&listen, &model, ctx)?;
             } else {
                 println!("use --install or --uninstall");
             }

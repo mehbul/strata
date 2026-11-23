@@ -36,6 +36,7 @@ tokio-util = "0.7"
 jsonschema = "0.29"
 tray-icon = "0.16"
 winit = "0.30"
+windows-service = "0.8"
 
 [features]
 default = []
