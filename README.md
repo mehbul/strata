@@ -503,7 +503,8 @@ choice here, by more than 2×.
 ### Do I need Ollama, LM Studio or a daemon?
 
 No. Strata starts and owns the llama.cpp process directly and exits with it.
-`pull` can copy a model out of an Ollama blob store if you already have one.
+`pull` fetches straight from Ollama's registry or Hugging Face, and can also use
+a local Ollama blob store if one is already present.
 
 ### Does it work on Linux?
 
@@ -558,9 +559,9 @@ runtime on the same machine:
 - [x] Measured tuning, over prefill and decode
 - [x] Hardware detection and per-machine setup
 - [x] Context compaction
-- [ ] Placement search over `-ot` patterns, not just a single cut point
-- [ ] Q4_K / Q6_K dequantisation, checked against a reference
-- [ ] BPE tokenizer over the file's own 248k vocab
+- [x] Placement search over `-ot` patterns, not just a single cut point
+- [x] Q4_K / Q6_K dequantisation, checked against a reference
+- [x] BPE tokenizer over the file's own 248k vocab
 - [ ] Forward pass — for this model a gated-DeltaNet SSM scan plus 256-expert
       routing, which is the hard part
 - [ ] HIP kernels for gfx1102
