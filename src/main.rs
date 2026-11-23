@@ -32,6 +32,7 @@ mod runner;
 mod server;
 mod setup;
 mod tools;
+mod tray;
 mod tune;
 mod tokenizer;
 mod updater;
@@ -127,6 +128,15 @@ enum DaemonAction {
     Status {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
+    },
+    /// Keep restarting the background server if it dies
+    Watch {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
     },
 }
 
@@ -254,6 +264,10 @@ enum Commands {
         token: Option<String>,
         #[arg(long)]
         registry: Option<String>,
+        #[arg(long)]
+        device: bool,
+        #[arg(long, default_value = "ollama")]
+        client_id: String,
     },
     /// Sign out of a model registry
     Signout,
@@ -443,6 +457,15 @@ enum Commands {
         install: bool,
         #[arg(long)]
         uninstall: bool,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+    },
+    /// Run a system-tray controller for the background server
+    Tray {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
         #[arg(long)]
@@ -686,7 +709,13 @@ async fn main() -> Result<()> {
             let name = model.context("model name is required: strata push <model>")?;
             push::push(&name, reg.as_deref(), token.as_deref(), insecure).await?
         }
-        Commands::Signin { token, registry } => auth::signin(token.as_deref(), registry.as_deref())?,
+        Commands::Signin { token, registry, device, client_id } => {
+            if device {
+                auth::signin_device(&client_id).await?;
+            } else {
+                auth::signin(token.as_deref(), registry.as_deref())?
+            }
+        }
         Commands::Signout => auth::signout()?,
         Commands::Ps { host: ps_host, json } => {
             let base = ps_host.unwrap_or(host);
@@ -834,6 +863,16 @@ async fn main() -> Result<()> {
                 println!("use --install or --uninstall");
             }
         }
+        Commands::Tray { listen, model, ctx } => {
+            let model = match model {
+                Some(m) => m,
+                None => registry::scan(&registry::default_root())
+                    .first()
+                    .map(|e| e.id.clone())
+                    .context("no models installed")?,
+            };
+            tray::run(listen, model, ctx).await?
+        }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { listen, model, ctx } => {
                 let model = match model {
@@ -847,6 +886,16 @@ async fn main() -> Result<()> {
             }
             DaemonAction::Stop => daemon::stop("127.0.0.1:8080")?,
             DaemonAction::Status { listen } => daemon::status(&listen).await?,
+            DaemonAction::Watch { listen, model, ctx } => {
+                let model = match model {
+                    Some(m) => m,
+                    None => registry::scan(&registry::default_root())
+                        .first()
+                        .map(|e| e.id.clone())
+                        .context("no models installed")?,
+                };
+                daemon::watch(&listen, &model, ctx).await?
+            }
         },
         Commands::Cert { host, dir } => {
             let certified = rcgen::generate_simple_self_signed(vec![host.clone()])?;

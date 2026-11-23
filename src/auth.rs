@@ -66,6 +66,68 @@ pub fn valid_key(presented: &str) -> bool {
     load_keys().iter().any(|k| k == presented)
 }
 
+/// OAuth 2.0 device-authorization grant, with endpoints configurable so a
+/// private registry can use the same flow as ollama.com.
+pub async fn signin_device(client_id: &str) -> Result<()> {
+    let code_url = std::env::var("OLLAMA_DEVICE_CODE_URL")
+        .unwrap_or_else(|_| "https://ollama.com/api/device/code".into());
+    let token_url = std::env::var("OLLAMA_DEVICE_TOKEN_URL")
+        .unwrap_or_else(|_| "https://ollama.com/api/token".into());
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&code_url)
+        .json(&serde_json::json!({ "client_id": client_id, "scope": "all" }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("device-code request failed: {}", response.status());
+    }
+    let body: serde_json::Value = response.json().await?;
+    let device_code = body["device_code"].as_str().unwrap_or("");
+    let user_code = body["user_code"].as_str().unwrap_or("");
+    let verify = body["verification_uri"].as_str().unwrap_or(&code_url);
+    let interval = body["interval"].as_u64().unwrap_or(5);
+    let expires = body["expires_in"].as_u64().unwrap_or(600);
+    println!("Open {verify} and enter code: {user_code}");
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        if started.elapsed().as_secs() > expires {
+            anyhow::bail!("device sign-in timed out");
+        }
+        let response = client
+            .post(&token_url)
+            .json(&serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+                "client_id": client_id,
+            }))
+            .send()
+            .await?;
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        if let Some(token) = body["access_token"].as_str() {
+            save_token(token)?;
+            println!("Signed in. Token stored at {}", token_path().display());
+            return Ok(());
+        }
+        let error = body["error"].as_str().unwrap_or("");
+        if error == "expired_token" {
+            anyhow::bail!("device code expired");
+        }
+    }
+}
+
+pub fn save_token(value: &str) -> Result<()> {
+    std::fs::create_dir_all(config_dir())?;
+    std::fs::write(token_path(), value)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(token_path(), std::fs::Permissions::from_mode(0o600)).ok();
+    }
+    Ok(())
+}
+
 pub fn signin(token: Option<&str>, registry: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(config_dir())?;
     let value = match token {

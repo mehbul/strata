@@ -1037,6 +1037,10 @@ button {
   background: var(--bg-elev);
   color: var(--fg);
 }
+/* Simple metric meters. */
+.meter { height: 5px; border-radius: 3px; background: var(--line, #333); overflow: hidden; }
+.meter-fill { height: 100%; background: var(--accent, #7ab); transition: width 200ms ease; }
+
 /* Composer request options. */
 .composer-options {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px;

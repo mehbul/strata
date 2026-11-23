@@ -167,6 +167,12 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   copying, deleting, pulling, pushing, creating from a Modelfile and embedding.
   The composer now controls think, reasoning effort, response format and
   keep-alive per request.
+- Final gap pass: DONE — cancellation tokens on upstream calls, full JSON
+  Schema validation with one retry, true `raw`/`suffix` via llama.cpp's
+  `/completion` and `/infill`, device-code signin, system-tray controller,
+  daemon watchdog with logon tasks, web metric meter, TLS crypto provider fix,
+  wider safetensors metadata, and more route tests. TLS verified with HTTPS
+  curl against a self-signed certificate; raw/suffix verified live.
 - Final fidelity pass: DONE — Ollama endpoints now stream raw NDJSON, default
   keep-alive is 5m, empty prompts implement load/unload, more Ollama options
   are mapped, generate accepts images, reasoning streams in `message.thinking`,

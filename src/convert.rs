@@ -27,6 +27,10 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(&11u32.to_le_bytes());
             out.extend_from_slice(&n.as_i64().unwrap().to_le_bytes());
         }
+        Value::Number(n) if n.is_f64() => {
+            out.extend_from_slice(&12u32.to_le_bytes());
+            out.extend_from_slice(&n.as_f64().unwrap().to_le_bytes());
+        }
         Value::Bool(b) => {
             out.extend_from_slice(&7u32.to_le_bytes());
             out.push(*b as u8);
@@ -64,6 +68,18 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
         .get("vocab_size")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let heads = config
+        .get("num_attention_heads")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let kv_heads = config
+        .get("num_key_value_heads")
+        .and_then(Value::as_u64)
+        .unwrap_or(heads);
+    let rope_base = config
+        .get("rope_theta")
+        .and_then(Value::as_f64)
+        .unwrap_or(10000.0);
 
     let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .flatten()
@@ -92,6 +108,7 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
             let dtype = match meta.get("dtype").and_then(Value::as_str) {
                 Some("F32") => 0u32,
                 Some("F16") => 1u32,
+                Some("BF16") => 30u32,
                 Some(other) => bail!("unsupported safetensors dtype {other} for {name}"),
                 None => bail!("tensor {name} has no dtype"),
             };
@@ -127,6 +144,10 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
         (format!("{arch}.context_length"), json!(ctx)),
         (format!("{arch}.embedding_length"), json!(embed)),
         (format!("{arch}.vocab_size"), json!(vocab)),
+        (format!("{arch}.attention.head_count"), json!(heads)),
+        (format!("{arch}.attention.head_count_kv"), json!(kv_heads)),
+        (format!("{arch}.rope.freq_base"), json!(rope_base)),
+        ("tokenizer.ggml.model".into(), json!("gpt2")),
     ];
     for (k, v) in &metadata {
         put_string(&mut out, k);

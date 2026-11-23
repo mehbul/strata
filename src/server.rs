@@ -2310,6 +2310,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         anyhow::bail!("set both STRATA_TLS_CERT and STRATA_TLS_KEY, or neither");
     }
     if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
             .await
             .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?;
@@ -2676,7 +2677,17 @@ async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>)
     if let Some(key) = connection_key_for_url(&upstream) {
         request = request.bearer_auth(key);
     }
-    let resp = match request.send().await {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_guard = cancel.clone().drop_guard();
+    let resp = match tokio::select! {
+        resp = request.send() => resp,
+        _ = cancel.cancelled() => {
+            return (
+                axum::http::StatusCode::from_u16(499).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                Json(json!({ "error": "client closed the request" })),
+            ).into_response()
+        }
+    } {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => return anthropic_error(502, &format!("compute process returned {}", r.status())),
         Err(e) => return anthropic_error(502, &format!("cannot reach compute process ({e})")),
@@ -2750,6 +2761,134 @@ async fn ollama_generate(State(state): State<Shared>, Json(req): Json<Value>) ->
     ollama_forward(state, req, false).await
 }
 
+/// Raw prompts and suffix-based infill go through llama.cpp's native
+/// `/completion` and `/infill` endpoints, which bypass the chat template and
+/// support true prefix/suffix completion.
+async fn raw_completion_forward(
+    state: Shared,
+    req: &Value,
+    upstream: &str,
+    model: &str,
+    chat: bool,
+) -> Response {
+    let model = model.to_string();
+    let prompt = req.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let suffix = req.get("suffix").and_then(Value::as_str).unwrap_or("");
+    let raw = req.get("raw").and_then(Value::as_bool).unwrap_or(false);
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(true);
+    let endpoint = if suffix.is_empty() || raw { "completion" } else { "infill" };
+    let mut body = if endpoint == "completion" {
+        json!({ "prompt": prompt })
+    } else {
+        json!({ "input_prefix": prompt, "input_suffix": suffix })
+    };
+    if let Some(opts) = req.get("options") {
+        for (from, to) in [
+            ("temperature", "temperature"),
+            ("top_k", "top_k"),
+            ("top_p", "top_p"),
+            ("seed", "seed"),
+            ("repeat_penalty", "repeat_penalty"),
+            ("num_predict", "n_predict"),
+        ] {
+            if let Some(v) = opts.get(from) {
+                body[to] = v.clone();
+            }
+        }
+        if let Some(stop) = opts.get("stop") {
+            body["stop"] = stop.clone();
+        }
+    }
+    body["stream"] = json!(stream);
+
+    let started = Instant::now();
+    let resp = match state
+        .client
+        .post(format!("{upstream}/{endpoint}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("runtime returned {}", r.status()) })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    if !stream {
+        let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        let text = value
+            .get("content")
+            .or_else(|| value.get("response"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut out = crate::ollama::complete(
+            &model,
+            chat,
+            &json!({ "role": "assistant", "content": text }),
+            "stop",
+            &json!({}),
+        );
+        add_durations(&mut out, started.elapsed(), None);
+        return Json(out).into_response();
+    }
+
+    let mut inner = resp.bytes_stream();
+    let stream_model = model.clone();
+    let stream = async_stream::stream! {
+        let model = &stream_model;
+        let mut buf = String::new();
+        let mut first: Option<std::time::Duration> = None;
+        while let Some(chunk) = inner.next().await {
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" { continue }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+                    let text = v.get("content")
+                        .or_else(|| v.get("response"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if text.is_empty() { continue }
+                    if first.is_none() { first = Some(started.elapsed()); }
+                    let delta = if chat {
+                        crate::ollama::chat_chunk(&json!({ "content": text }), model, false)
+                    } else {
+                        crate::ollama::generate_chunk(&json!({ "content": text }), model, false)
+                    };
+                    yield Ok::<_, Infallible>(http_body::Frame::data(bytes::Bytes::from(format!("{delta}\n"))));
+                }
+            }
+        }
+        let mut last = crate::ollama::final_chunk(model, chat, "stop", &json!({}));
+        add_durations(&mut last, started.elapsed(), first);
+        yield Ok(http_body::Frame::data(bytes::Bytes::from(format!("{last}\n"))));
+    };
+    let body = axum::body::Body::new(http_body_util::StreamBody::new(stream));
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        body,
+    )
+        .into_response()
+}
+
 /// Shared path for both Ollama endpoints: translate, forward, translate back.
 async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
     if req.get("keep_alive").is_none() {
@@ -2804,6 +2943,12 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
                 .into_response()
         }
     };
+    if !chat
+        && (req.get("raw").and_then(Value::as_bool).unwrap_or(false)
+            || req.get("suffix").and_then(Value::as_str).is_some())
+    {
+        return raw_completion_forward(state, &req, &upstream, &model, chat).await;
+    }
     apply_keep_alive(&state, &req, &model).await;
     let context = prompt_context(&state, &model, &req);
     let started = Instant::now();
@@ -2836,7 +2981,17 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
     if let Some(key) = connection_key_for_url(&upstream) {
         request = request.bearer_auth(key);
     }
-    let resp = match request.send().await {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_guard = cancel.clone().drop_guard();
+    let resp = match tokio::select! {
+        resp = request.send() => resp,
+        _ = cancel.cancelled() => {
+            return (
+                axum::http::StatusCode::from_u16(499).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                Json(json!({ "error": "client closed the request" })),
+            ).into_response()
+        }
+    } {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             return (
@@ -2855,7 +3010,40 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
     };
 
     if !stream {
-        let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        let mut body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        // Retry once when an explicit response format was ignored. The hint is
+        // appended as a user turn so it survives every chat template.
+        if let Some(format) = req.get("format").or_else(|| req.get("response_format")) {
+            let text = body
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !crate::dialects::valid_structured(text, format) {
+                eprintln!("strata: response format not honoured; retrying once");
+                // Rebuild from the translated request instead of the reply.
+                let mut translated = crate::ollama::chat_to_openai(&req)
+                    .or_else(|_| crate::ollama::generate_to_openai(&req))
+                    .unwrap_or_else(|_| json!({ "messages": [] }));
+                if let Some(msgs) = translated.get_mut("messages").and_then(Value::as_array_mut) {
+                    msgs.push(json!({
+                        "role": "user",
+                        "content": "Your previous reply was not valid for the requested format. Reply again with only valid output."
+                    }));
+                }
+                translated["stream"] = json!(false);
+                if let Ok(retry_resp) = state
+                    .client
+                    .post(format!("{upstream}/v1/chat/completions"))
+                    .json(&translated)
+                    .send()
+                    .await
+                {
+                    if retry_resp.status().is_success() {
+                        body = retry_resp.json::<Value>().await.unwrap_or(body);
+                    }
+                }
+            }
+        }
         let choice = body
             .get("choices")
             .and_then(|c| c.as_array())

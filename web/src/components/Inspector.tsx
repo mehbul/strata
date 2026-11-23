@@ -128,6 +128,9 @@ function Session({ health }: { health: Health | null }) {
         <h3 className="group-title">Scheduler</h3>
         <p className="muted">Resident models: {residents + (m?.owned ? 1 : 0)} / {residentCapacity}</p>
         <p className="muted">Turns: {admitted} admitted · {completed} completed · {rejected} rejected</p>
+        <div className="meter" title={`${completed} completed / ${admitted} admitted`}>
+          <div className="meter-fill" style={{ width: `${admitted ? Math.round(completed / admitted * 100) : 0}%` }} />
+        </div>
         <div className="slots">
           {Array.from({ length: slots }, (_, i) => {
             const busy = i < (s?.active ?? 0)

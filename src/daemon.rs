@@ -134,6 +134,22 @@ pub fn stop(listen: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn watch(listen: &str, model: &str, ctx: usize) -> Result<()> {
+    println!("Watching Strata on http://{listen} (model {model})");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        if healthy(listen).await {
+            continue;
+        }
+        match read_pid() {
+            Some(pid) if alive(pid) => continue,
+            _ => {}
+        }
+        println!("Server is down; restarting…");
+        start(listen, model, ctx).await?;
+    }
+}
+
 pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
     let exe = std::env::current_exe()?;
     let command = format!(
@@ -148,16 +164,30 @@ pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
     if !out.status.success() {
         bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    println!("Installed logon task 'Strata' for {model} on http://{listen}");
+    let watch_command = format!(
+        "\"{}\" daemon watch --listen {} --model {} --ctx {}",
+        exe.display(), listen, model, ctx
+    );
+    let watch = Command::new("schtasks")
+        .args([
+            "/Create", "/TN", "Strata-Watch", "/TR", &watch_command, "/SC", "ONLOGON", "/F",
+        ])
+        .output()?;
+    if !watch.status.success() {
+        bail!("schtasks watchdog failed: {}", String::from_utf8_lossy(&watch.stderr).trim());
+    }
+    println!("Installed logon tasks 'Strata' and 'Strata-Watch' for {model} on http://{listen}");
     Ok(())
 }
 
 pub fn service_uninstall() -> Result<()> {
-    let out = Command::new("schtasks").args(["/Delete", "/TN", "Strata", "/F"]).output()?;
-    if !out.status.success() {
-        bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    for name in ["Strata", "Strata-Watch"] {
+        let out = Command::new("schtasks").args(["/Delete", "/TN", name, "/F"]).output()?;
+        if !out.status.success() {
+            println!("could not remove task {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
     }
-    println!("Removed logon task 'Strata'.");
+    println!("Removed logon tasks.");
     Ok(())
 }
 

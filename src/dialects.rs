@@ -215,12 +215,17 @@ pub fn valid_structured(text: &str, format: &Value) -> bool {
         Value::Object(o) => o,
         _ => return true,
     };
-    if let Some(Value::Array(required)) = schema.get("required") {
-        return required.iter().all(|k| {
-            k.as_str().map_or(false, |key| value.get(key).is_some())
-        });
+    match jsonschema::validator_for(&Value::Object(schema.clone())) {
+        Ok(validator) => validator.is_valid(&value),
+        // A schema we cannot compile is not evidence that the answer is bad.
+        Err(_) => {
+            if let Some(Value::Array(required)) = schema.get("required") {
+                required.iter().all(|k| k.as_str().map_or(false, |key| value.get(key).is_some()))
+            } else {
+                true
+            }
+        }
     }
-    true
 }
 
 /// One SSE event for a streaming `/v1/responses` answer.
