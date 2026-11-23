@@ -53,6 +53,7 @@ export default function App() {
   )
   const [think, setThink] = useState(false)
   const [format, setFormat] = useState("")
+  const [schema, setSchema] = useState("")
   const [keepAlive, setKeepAlive] = useState("")
   const [image, setImage] = useState<string | undefined>()
   const [reasoningEffort, setReasoningEffort] = useState("")
@@ -160,7 +161,7 @@ export default function App() {
         temperature: 0.7,
         maxTokens: 4096,
         reasoning: think,
-        format: format || undefined,
+        format: schema.trim() || format || undefined,
         keepAlive: keepAlive || undefined,
         reasoningEffort: reasoningEffort || undefined,
         image,
@@ -180,7 +181,7 @@ export default function App() {
       setBusy(false)
       abort.current = null
     }
-  }, [draft, busy, turns, model, system, think, format, keepAlive, reasoningEffort, image])
+  }, [draft, busy, turns, model, system, think, format, schema, keepAlive, reasoningEffort, image])
 
   const startNew = () => {
     abort.current?.abort()
@@ -372,6 +373,7 @@ export default function App() {
               >
                 <option value="">text</option>
                 <option value="json">JSON</option>
+                <option value="schema" onClick={() => setSchema('{"type":"object","required":["answer"]}')}>JSON schema</option>
               </select>
               <select
                 aria-label="Keep alive"
@@ -386,6 +388,15 @@ export default function App() {
                 <option value="0">unload after</option>
               </select>
             </div>
+            {schema && (
+              <textarea
+                aria-label="JSON schema"
+                rows={3}
+                value={schema}
+                placeholder='{"type":"object","required":["answer"]}'
+                onChange={(e) => setSchema(e.target.value)}
+              />
+            )}
             <div className="composer">
               <textarea
                 ref={field}

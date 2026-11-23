@@ -31,6 +31,7 @@ clap_complete = "4"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["crypto"] }
 
 [features]
 default = []

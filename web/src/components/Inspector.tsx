@@ -85,7 +85,7 @@ export function Inspector({
         {pane === "session" ? (
           <Session health={health} />
         ) : pane === "models" ? (
-          <Models connected={connected} />
+          <Models connected={connected} health={health} />
         ) : pane === "experts" ? (
           <Experts connected={connected} simulated={!!health?.simulated} />
         ) : pane === "profiling" ? (
@@ -107,6 +107,9 @@ function Session({ health }: { health: Health | null }) {
   const slots = s?.capacity ?? health?.kv_slots ?? 4
   const residents = (health as any)?.additional_residents ?? 0
   const residentCapacity = (health as any)?.resident_capacity ?? 1
+  const admitted = s?.admitted ?? 0
+  const completed = s?.completed ?? 0
+  const rejected = (s?.rejected ?? 0) + (s?.timed_out ?? 0) + (s?.cancelled ?? 0)
   const lost = s ? s.rejected + s.timed_out + s.cancelled : 0
 
   if (!health) return <p className="empty-note">Not connected to the engine.</p>
@@ -124,6 +127,7 @@ function Session({ health }: { health: Health | null }) {
       <section className="group">
         <h3 className="group-title">Scheduler</h3>
         <p className="muted">Resident models: {residents + (m?.owned ? 1 : 0)} / {residentCapacity}</p>
+        <p className="muted">Turns: {admitted} admitted · {completed} completed · {rejected} rejected</p>
         <div className="slots">
           {Array.from({ length: slots }, (_, i) => {
             const busy = i < (s?.active ?? 0)
@@ -657,7 +661,7 @@ function Profiling({ connected }: { connected: boolean }) {
   )
 }
 
-function Models({ connected }: { connected: boolean }) {
+function Models({ connected, health }: { connected: boolean; health: Health | null }) {
   const [models, setModels] = useState<InstalledModel[]>([])
   const [running, setRunning] = useState<RunningModel[]>([])
   const [selected, setSelected] = useState("")
@@ -666,6 +670,7 @@ function Models({ connected }: { connected: boolean }) {
   const [pull, setPull] = useState("")
   const [createName, setCreateName] = useState("")
   const [modelfile, setModelfile] = useState("FROM ")
+  const [modelfileError, setModelfileError] = useState("")
   const [embedText, setEmbedText] = useState("")
   const [message, setMessage] = useState("")
   const [busy, setBusy] = useState(false)
@@ -724,6 +729,7 @@ function Models({ connected }: { connected: boolean }) {
       </div>
 
       <h3>Running</h3>
+      <p className="muted">{(health as any)?.additional_residents ?? 0} additional resident(s) · capacity {(health as any)?.resident_capacity ?? 1}</p>
       <div className="model-list">
         {running.map((m) => (
           <div key={m.name} className="model-row">
@@ -754,8 +760,13 @@ function Models({ connected }: { connected: boolean }) {
 
       <h3>Create from Modelfile</h3>
       <input aria-label="New model name" placeholder="new model name" value={createName} onChange={(e) => setCreateName(e.target.value)} />
-      <textarea aria-label="Modelfile" rows={5} value={modelfile} onChange={(e) => setModelfile(e.target.value)} />
-      <button className="btn" disabled={busy || !createName} onClick={() =>
+      <textarea aria-label="Modelfile" rows={5} value={modelfile} onChange={(e) => {
+        setModelfile(e.target.value)
+        const from = e.target.value.split("\n").find((l) => l.trim().toUpperCase().startsWith("FROM "))
+        setModelfileError(from ? "" : "Modelfile needs a FROM line")
+      }} />
+      {modelfileError && <p className="muted" role="alert">{modelfileError}</p>}
+      <button className="btn" disabled={busy || !createName || !!modelfileError} onClick={() =>
         void act("Create", () => createModel(createName, { modelfile }))}>Create</button>
 
       <h3>Embed</h3>

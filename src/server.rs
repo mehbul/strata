@@ -375,6 +375,8 @@ pub struct AppState {
     default_ctx: usize,
     default_kv_type: Option<String>,
     default_backend: crate::backend::Backend,
+    max_queue: usize,
+    num_parallel: usize,
 }
 
 /// A model loaded alongside the primary one. Each resident owns a compute
@@ -555,7 +557,8 @@ async fn health(State(state): State<Shared>) -> Json<Value> {
             "active": s.active.load(Ordering::Relaxed),
             "capacity": KV_SLOTS,
             "queued": s.queued.load(Ordering::Relaxed),
-            "max_queue": MAX_QUEUE,
+            "max_queue": state.max_queue,
+            "num_parallel": state.num_parallel,
             "queue_timeout_seconds": QUEUE_TIMEOUT_S,
             "admitted": s.admitted.load(Ordering::Relaxed),
             "completed": s.completed.load(Ordering::Relaxed),
@@ -632,7 +635,10 @@ async fn drain_and_unload(state: &Shared) -> std::result::Result<bool, Response>
     };
     let drained = tokio::time::timeout(
         std::time::Duration::from_secs(DRAIN_TIMEOUT_S),
-        state.permits.clone().acquire_many_owned(KV_SLOTS as u32),
+        state
+            .permits
+            .clone()
+            .acquire_many_owned(state.num_parallel as u32),
     )
     .await;
     let Ok(Ok(_all_slots)) = drained else {
@@ -798,6 +804,52 @@ async fn api_connect(Json(req): Json<Value>) -> Response {
     }
 }
 
+/// DELETE /api/connect - forget a remote endpoint.
+async fn api_disconnect(Json(req): Json<Value>) -> Response {
+    let model = req.get("model").and_then(Value::as_str).unwrap_or("");
+    let mut all = load_connections();
+    if all.remove(model).is_none() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no connection for {model}") })),
+        )
+            .into_response();
+    }
+    let encoded = serde_json::to_string_pretty(&all).unwrap_or_default();
+    match std::fs::write(connections_path(), encoded) {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn compaction_value(state: &Shared) -> Value {
+    let s = &state.compactor.stats;
+    json!({
+        "enabled": state.compactor.stats.last_budget.load(Ordering::Relaxed) > 0,
+        "summarised": s.summarised.load(Ordering::Relaxed),
+        "reused": s.reused.load(Ordering::Relaxed),
+        "reclaimed": s.reclaimed.load(Ordering::Relaxed),
+    })
+}
+
+fn ndjson_response(lines: Vec<String>) -> Response {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        out,
+    )
+        .into_response()
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -847,7 +899,7 @@ pub fn keep_alive_seconds(v: &Value) -> Option<Option<u64>> {
 /// Refresh the unload timer after an Ollama request. A `keep_alive` of 0 is the
 /// documented "unload now" idiom; -1 cancels unloading entirely.
 async fn apply_keep_alive(state: &Shared, req: &Value, model: &str) {
-    let seconds = request_keep_alive(req);
+    let seconds = request_keep_alive(req).or(Some(Some(300)));
     if let Some(Some(secs)) = seconds {
         // A resident can expire on its own without touching the primary. The
         // deadline check makes a later request's refresh win over this timer.
@@ -1642,6 +1694,9 @@ struct TurnGuard {
 /// Wait for a scheduler slot, reporting the wait honestly via `queued` /
 /// `timed_out`. Returns None if the queue timeout elapsed first.
 async fn admit(state: &Shared) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if state.sched.queued.load(Ordering::Relaxed) >= state.max_queue as u64 {
+        return None;
+    }
     state.sched.queued.fetch_add(1, Ordering::Relaxed);
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(QUEUE_TIMEOUT_S),
@@ -2119,6 +2174,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     }
     println!("  NOTE: the expert map in /experts is SIMULATED; the router is not observable yet.");
 
+    let num_parallel = std::env::var("OLLAMA_NUM_PARALLEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(KV_SLOTS);
     let state: Shared = Arc::new(AppState {
         model: std::sync::Mutex::new(model.clone()),
         models_root: crate::registry::default_root(),
@@ -2131,6 +2191,15 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         default_ctx: ctx,
         default_kv_type: kv_type.clone(),
         default_backend: selected_backend,
+        max_queue: std::env::var("OLLAMA_MAX_QUEUE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MAX_QUEUE),
+        num_parallel: std::env::var("OLLAMA_NUM_PARALLEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(KV_SLOTS),
         compactor,
         upstream: endpoint,
         client,
@@ -2156,7 +2225,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             .unwrap_or(0.0),
         sched: Sched::default(),
         metrics: Metrics::default(),
-        permits: Arc::new(tokio::sync::Semaphore::new(KV_SLOTS)),
+        permits: Arc::new(tokio::sync::Semaphore::new(num_parallel)),
         profile: Mutex::new(Vec::new()),
         experts: Mutex::new(Experts::new(layers, n_experts, top_k, vram_frac, ram_frac)),
     });
@@ -2205,7 +2274,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         )
         .route("/api/embed", post(ollama_embed))
         .route("/api/embeddings", post(ollama_embeddings))
-        .route("/api/connect", post(api_connect))
+        .route("/api/connect", post(api_connect).delete(api_disconnect))
         .route("/api/keys", get(api_keys_list).post(api_keys_add).delete(api_keys_remove))
         .route("/api/version", get(ollama_version))
         .layer(axum::middleware::from_fn_with_state(
@@ -2357,6 +2426,8 @@ mod http_tests {
             default_ctx: 8192,
             default_kv_type: None,
             default_backend: crate::backend::Backend::LlamaCpp,
+            max_queue: MAX_QUEUE,
+            num_parallel: KV_SLOTS,
         })
     }
 
@@ -2411,6 +2482,35 @@ mod http_tests {
         let (status, body) = fetch(app, "/compact").await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(body.get("enabled").is_some());
+    }
+
+    #[tokio::test]
+    async fn more_routes_answer() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/version", get(ollama_version))
+            .route("/api/tags", get(ollama_tags))
+            .route("/api/ps", get(ollama_ps))
+            .route("/api/models", get(api_models))
+            .route("/api/models/current", get(api_models_current))
+            .route("/v1/models", get(models))
+            .route("/metrics", get(metrics))
+            .route("/profile", get(profile))
+            .route("/experts", get(experts))
+            .route("/compact", get(compaction))
+            .with_state(state);
+        for path in [
+            "/api/version", "/api/tags", "/api/ps", "/api/models",
+            "/api/models/current", "/v1/models", "/metrics", "/profile",
+            "/experts", "/compact",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{path}");
+        }
     }
 
     #[tokio::test]
@@ -2527,7 +2627,7 @@ mod access_tests {
             vec!["hello"]
         );
         let mixed = json!({ "input": ["a", { "text": "b" }, 7] });
-        assert_eq!(embed_inputs(&mixed, false), vec!["a", "b"]);
+        assert_eq!(embed_inputs(&mixed, false), vec![json!("a"), json!({ "text": "b" })]);
     }
 }
 
@@ -2667,6 +2767,33 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
         .unwrap_or("")
         .to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    let keep = request_keep_alive(&req).or(Some(Some(300))); // Ollama's default
+    let empty_turn = if chat {
+        req.get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|m| m.is_empty())
+    } else {
+        req.get("prompt").and_then(Value::as_str).unwrap_or("").is_empty()
+    };
+    if empty_turn {
+        let unload = matches!(keep, Some(Some(0)));
+        if unload {
+            drain_and_unload(&state).await.ok();
+        } else {
+            ensure_upstream(&state, &model, keep).await.ok();
+        }
+        let reason = if unload { "unload" } else { "load" };
+        let mut out = crate::ollama::complete(
+            &model,
+            chat,
+            &json!({ "role": "assistant", "content": "" }),
+            reason,
+            &json!({}),
+        );
+        out["done_reason"] = json!(reason);
+        return Json(out).into_response();
+    }
+    apply_keep_alive(&state, &req, &model).await;
     let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
         Ok(u) => u,
         Err(e) => {
@@ -2746,11 +2873,13 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
         if !context.is_empty() {
             out.as_object_mut().unwrap().insert("context".into(), json!(context));
         }
+        out.as_object_mut().unwrap().insert("compaction".into(), compaction_value(&state));
         add_durations(&mut out, started.elapsed(), None);
         return Json(out).into_response();
     }
 
     // Ollama streams newline-delimited JSON, not SSE. Each line is one object.
+    // Build a plain NDJSON body so clients never see `data:` frames.
     let mut inner = resp.bytes_stream();
     let stream = async_stream::stream! {
         let mut buf = String::new();
@@ -2802,7 +2931,7 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
                             crate::ollama::generate_chunk(delta, &model, false)
                         };
                         yield Ok::<_, Infallible>(
-                            Event::default().data(format!("{out}\n")),
+                            http_body::Frame::data(bytes::Bytes::from(format!("{out}\n"))),
                         );
                     }
                 }
@@ -2812,11 +2941,16 @@ async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
         if !context.is_empty() {
             last.as_object_mut().unwrap().insert("context".into(), json!(context));
         }
+        last.as_object_mut().unwrap().insert("compaction".into(), compaction_value(&state));
         add_durations(&mut last, started.elapsed(), first);
-        yield Ok(Event::default().data(format!("{last}\n")));
+        yield Ok(http_body::Frame::data(bytes::Bytes::from(format!("{last}\n"))));
     };
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
+    let body = axum::body::Body::new(http_body_util::StreamBody::new(stream));
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        body,
+    )
         .into_response()
 }
 
@@ -3299,18 +3433,27 @@ async fn openai_responses(State(state): State<Shared>, Json(req): Json<Value>) -
 /// Extract embedding inputs from either Ollama's `input` or the legacy
 /// `prompt` field. A single string stays a single string; a list may mix plain
 /// text with objects carrying `text`.
-fn embed_inputs(req: &Value, legacy: bool) -> Vec<String> {
+fn embed_inputs(req: &Value, legacy: bool) -> Vec<Value> {
     let raw = req.get(if legacy { "prompt" } else { "input" });
     let mut out = Vec::new();
     match raw {
-        Some(Value::String(s)) => out.push(s.clone()),
+        Some(Value::String(s)) => out.push(json!(s)),
         Some(Value::Array(items)) => {
             for item in items {
                 match item {
-                    Value::String(s) => out.push(s.clone()),
+                    Value::String(s) => out.push(json!(s)),
                     Value::Object(o) => {
+                        let mut entry = serde_json::Map::new();
                         if let Some(s) = o.get("text").and_then(Value::as_str) {
-                            out.push(s.to_string());
+                            entry.insert("text".into(), json!(s));
+                        }
+                        for key in ["image", "audio"] {
+                            if let Some(data) = o.get(key).and_then(Value::as_str) {
+                                entry.insert(key.into(), json!(data));
+                            }
+                        }
+                        if !entry.is_empty() {
+                            out.push(Value::Object(entry));
                         }
                     }
                     _ => {}
@@ -3506,12 +3649,12 @@ async fn ollama_create(State(state): State<Shared>, Json(req): Json<Value>) -> R
         ),
     };
     match result {
-        Ok(()) => Json(json!({ "status": "success" })).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(()) => ndjson_response(vec![
+            json!({ "status": "reading model metadata" }).to_string(),
+            json!({ "status": "creating model" }).to_string(),
+            json!({ "status": "success" }).to_string(),
+        ]),
+        Err(e) => ndjson_response(vec![json!({ "error": e.to_string() }).to_string()]),
     }
 }
 
@@ -3569,12 +3712,12 @@ async fn ollama_pull(Json(req): Json<Value>) -> Response {
 async fn ollama_push(Json(req): Json<Value>) -> Response {
     let name = req.get("model").and_then(Value::as_str).unwrap_or("");
     match crate::push::push(name, None, None, false).await {
-        Ok(()) => Json(json!({ "status": "success" })).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(()) => ndjson_response(vec![
+            json!({ "status": "retrieving manifest" }).to_string(),
+            json!({ "status": "pushing manifest" }).to_string(),
+            json!({ "status": "success" }).to_string(),
+        ]),
+        Err(e) => ndjson_response(vec![json!({ "error": e.to_string() }).to_string()]),
     }
 }
 

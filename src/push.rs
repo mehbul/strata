@@ -112,7 +112,9 @@ pub async fn push(
     std::fs::write(&config_path, config.to_string())?;
     let config_digest = upload_blob(&client, &registry, &repo, &token, &config_path).await?;
     std::fs::remove_file(&config_path).ok();
+    println!("  uploaded config layer {config_digest}");
     let model_digest = upload_blob(&client, &registry, &repo, &token, &gguf).await?;
+    println!("  uploaded model layer {model_digest}");
 
     // Derived models keep their Modelfile overrides in strata.json. Push them
     // as ordinary layers so a pull on another machine gets the same system
@@ -134,6 +136,7 @@ pub async fn push(
                     ));
                     std::fs::write(&tmp, content)?;
                     let digest = upload_blob(&client, &registry, &repo, &token, &tmp).await?;
+                    println!("  uploaded {key} layer {digest}");
                     std::fs::remove_file(&tmp).ok();
                     extra_layers.push(json!({
                         "mediaType": format!("application/vnd.ollama.image.{key}"),

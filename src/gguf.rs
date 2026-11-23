@@ -407,7 +407,8 @@ impl ModelFacts {
             .metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.len())
-            .ok_or_else(|| anyhow!("no tokenizer.ggml.tokens array in file"))?;
+            .or_else(|| gguf.key_u64("vocab_size").map(|n| n as usize))
+            .unwrap_or(0);
         Ok(Self {
             name: gguf.name().to_string(),
             arch: gguf.arch().to_string(),

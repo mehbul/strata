@@ -167,6 +167,14 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   copying, deleting, pulling, pushing, creating from a Modelfile and embedding.
   The composer now controls think, reasoning effort, response format and
   keep-alive per request.
+- Final fidelity pass: DONE — Ollama endpoints now stream raw NDJSON, default
+  keep-alive is 5m, empty prompts implement load/unload, more Ollama options
+  are mapped, generate accepts images, reasoning streams in `message.thinking`,
+  `DELETE /api/connect` exists, create/push stream status lines, embed accepts
+  multimodal objects, `OLLAMA_MAX_QUEUE`/`NUM_PARALLEL` are honoured, compaction
+  is reported in responses, and push logs layer progress. The web console has
+  Modelfile validation, resident metrics and JSON-schema input. TLS cert
+  generation, safetensors conversion and daemon log rotation are included.
 - Final completion pass: DONE — TLS via `STRATA_TLS_CERT`/`STRATA_TLS_KEY`,
   shell completions, Windows logon task, `export`/`import` bundles, upload
   timeout, `/api/keys`, schema validation marker, extra install flags.

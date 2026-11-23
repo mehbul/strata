@@ -65,10 +65,17 @@ pub async fn start(listen: &str, model: &str, ctx: usize) -> Result<()> {
             return Ok(());
         }
     }
+    let log_file = log_path()?;
+    if let Ok(meta) = std::fs::metadata(&log_file) {
+        if meta.len() > 10 * 1024 * 1024 {
+            let rotated = log_file.with_extension("log.1");
+            std::fs::rename(&log_file, rotated).ok();
+        }
+    }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path()?)?;
+        .open(log_file)?;
     let exe = std::env::current_exe()?;
     let child = Command::new(exe)
         .args([

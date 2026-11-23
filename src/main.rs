@@ -11,6 +11,7 @@ mod backend;
 mod bench;
 mod blob;
 mod compact;
+mod convert;
 mod daemon;
 mod dequant;
 mod dialects;
@@ -286,6 +287,13 @@ enum Commands {
         #[arg(long)]
         keep_blobs: bool,
     },
+    /// Convert a safetensors directory into a GGUF (F32/F16)
+    Convert {
+        #[arg(long)]
+        safetensors: String,
+        #[arg(long)]
+        out: String,
+    },
     /// Export a model, its config and tags as a .tar.gz bundle
     Export {
         #[arg(long)]
@@ -447,6 +455,13 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Generate a self-signed TLS certificate and key
+    Cert {
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        #[arg(long, default_value = ".")]
+        dir: String,
+    },
     /// Print a shell completion script
     Completion {
         #[arg(value_enum)]
@@ -496,6 +511,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
+    let nowordwrap = cli.nowordwrap;
+    let verbose = cli.verbose;
     let host = cli.host.unwrap_or_else(default_host);
 
     match cli.command {
@@ -587,6 +604,8 @@ async fn main() -> Result<()> {
                 }
             } else if parameters {
                 println!("{}", body["parameters"].as_str().unwrap_or(""));
+            } else if nowordwrap {
+                println!("{}", serde_json::to_string(&body)?);
             } else {
                 println!("{}", serde_json::to_string_pretty(&body)?);
             }
@@ -624,7 +643,7 @@ async fn main() -> Result<()> {
                 keepalive,
                 image,
                 think,
-                verbose: cli.verbose,
+                verbose,
             }).await?
         }
         Commands::Stop { model, model_flag, host: stop_host } => {
@@ -720,6 +739,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Convert { safetensors, out } => convert::convert(&safetensors, &out)?,
         Commands::Export { model, out } => tools::export_bundle(&model, &out)?,
         Commands::Import { file } => tools::import_bundle(&file)?,
         Commands::Quantize { input, output, kind } => tools::quantize(&input, &output, &kind)?,
@@ -828,6 +848,14 @@ async fn main() -> Result<()> {
             DaemonAction::Stop => daemon::stop("127.0.0.1:8080")?,
             DaemonAction::Status { listen } => daemon::status(&listen).await?,
         },
+        Commands::Cert { host, dir } => {
+            let certified = rcgen::generate_simple_self_signed(vec![host.clone()])?;
+            let cert = std::path::Path::new(&dir).join("cert.pem");
+            let key = std::path::Path::new(&dir).join("key.pem");
+            std::fs::write(&cert, certified.cert.pem())?;
+            std::fs::write(&key, certified.key_pair.serialize_pem())?;
+            println!("wrote {} and {}\nSet STRATA_TLS_CERT/STRATA_TLS_KEY to serve HTTPS.", cert.display(), key.display());
+        }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();

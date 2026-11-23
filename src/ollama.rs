@@ -119,8 +119,13 @@ pub fn chat_to_openai(req: &Value) -> anyhow::Result<Value> {
         for (from, to) in [
             ("temperature", "temperature"),
             ("top_p", "top_p"),
+            ("top_k", "top_k"),
             ("num_predict", "max_tokens"),
             ("seed", "seed"),
+            ("repeat_penalty", "repeat_penalty"),
+            ("presence_penalty", "presence_penalty"),
+            ("frequency_penalty", "frequency_penalty"),
+            ("min_p", "min_p"),
         ] {
             if let Some(v) = opts.get(from) {
                 out.insert(to.into(), v.clone());
@@ -214,15 +219,33 @@ pub fn generate_to_openai(req: &Value) -> anyhow::Result<Value> {
             prompt.push_str(suffix);
         }
     }
-    messages.push(json!({ "role": "user", "content": prompt }));
+    let content = match req.get("images").and_then(Value::as_array) {
+        Some(images) if !images.is_empty() => {
+            let mut parts = vec![json!({ "type": "text", "text": prompt })];
+            for image in images.iter().filter_map(Value::as_str) {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{image}") }
+                }));
+            }
+            json!(parts)
+        }
+        _ => json!(prompt),
+    };
+    messages.push(json!({ "role": "user", "content": content }));
     out.insert("messages".into(), json!(messages));
 
     if let Some(opts) = req.get("options") {
         for (from, to) in [
             ("temperature", "temperature"),
             ("top_p", "top_p"),
+            ("top_k", "top_k"),
             ("num_predict", "max_tokens"),
             ("seed", "seed"),
+            ("repeat_penalty", "repeat_penalty"),
+            ("presence_penalty", "presence_penalty"),
+            ("frequency_penalty", "frequency_penalty"),
+            ("min_p", "min_p"),
         ] {
             if let Some(v) = opts.get(from) {
                 out.insert(to.into(), v.clone());
@@ -251,16 +274,17 @@ pub fn generate_to_openai(req: &Value) -> anyhow::Result<Value> {
 pub fn chat_chunk(delta: &Value, model: &str, done: bool) -> Value {
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
-    // Fall back to `reasoning_content` so a reasoning model's stream is not a
-    // run of empty chunks.
-    let text = delta
-        .get("content")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| delta.get("reasoning_content").and_then(|v| v.as_str()))
-        .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()))
+    let text = delta.get("content").and_then(Value::as_str).unwrap_or("");
+    let thinking = delta
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| delta.get("reasoning").and_then(Value::as_str))
         .unwrap_or("");
     message.insert("content".into(), json!(text));
+    // Ollama clients read a reasoning model's trace from `message.thinking`.
+    if !thinking.is_empty() {
+        message.insert("thinking".into(), json!(thinking));
+    }
 
     // OpenAI streams tool calls as fragments with string arguments; Ollama
     // wants whole calls with object arguments. Fragments are passed through as
