@@ -282,7 +282,7 @@ pub async fn run(
 
     if dry_run {
         println!("\nNothing measured or written (--dry-run).");
-        println!("Run without --dry-run to measure the expert split for this machine.");
+        println!("Run without --dry-run to measure the expert/layer split for this machine.");
         return Ok(());
     }
 
@@ -293,7 +293,7 @@ pub async fn run(
         println!("\n{} already exists — keeping it.", tuned.display());
         println!("Pass --force to measure again.");
     } else {
-        println!("\nMeasuring the expert split for this machine. This loads the model once per");
+        println!("\nMeasuring the expert/layer split for this machine. This loads the model once per");
         println!("configuration and takes a while; it is done once.\n");
         crate::tune::run(&model, choice.ctx, None, true).await?;
     }

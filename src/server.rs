@@ -16,7 +16,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, head, post},
     Router,
 };
 use futures::{Stream, StreamExt};
@@ -360,6 +360,32 @@ pub struct AppState {
     /// The compute process, when Strata started it. `None` when `--upstream`
     /// pointed at someone else's server, which is not ours to stop.
     compute: Option<tokio::sync::Mutex<Compute>>,
+    /// Bumped whenever a request refreshes the keep-alive timer. A scheduled
+    /// unload carries the value it was created with and does nothing if a
+    /// later request has superseded it.
+    keep_alive_gen: AtomicU64,
+    /// When the current keep-alive timer will unload the model, in epoch
+    /// seconds. Reported as `expires_at` by `/api/ps`.
+    keep_alive_deadline: Mutex<Option<u64>>,
+    /// Additional resident models, each with its own compute process and port.
+    /// The primary model above stays on `upstream`; this pool is only populated
+    /// when `OLLAMA_MAX_LOADED_MODELS` allows more than one resident.
+    residents: tokio::sync::Mutex<Vec<Resident>>,
+    max_resident: usize,
+    default_ctx: usize,
+    default_kv_type: Option<String>,
+    default_backend: crate::backend::Backend,
+}
+
+/// A model loaded alongside the primary one. Each resident owns a compute
+/// process on its own port so requests can be routed without swapping weights.
+struct Resident {
+    model: String,
+    compute: Compute,
+    upstream: String,
+    last_used: Instant,
+    keep_alive_secs: Option<u64>,
+    expires_at: Option<u64>,
 }
 
 /// The compute process and everything needed to start it again.
@@ -542,6 +568,13 @@ async fn health(State(state): State<Shared>) -> Json<Value> {
         // slot that does not hold the prefix. `scheduler.capacity` is the
         // separate, larger bound on concurrent turns.
         "kv_slots": 1,
+        "resident_capacity": state.max_resident,
+        "keep_alive_expires_at": state
+            .keep_alive_deadline
+            .lock()
+            .unwrap()
+            .map(crate::ollama::iso_utc),
+        "additional_residents": state.residents.try_lock().map(|r| r.len()).unwrap_or(0),
         "model": {
             // `owned` is false under --upstream, where the process is someone
             // else's and the console should not offer to stop it.
@@ -588,44 +621,276 @@ fn no_compute() -> Response {
         .into_response()
 }
 
-/// POST /model/unload - stop the compute process and give the VRAM back.
+/// Drain in-flight turns, then stop the compute process.
 ///
-/// Every scheduler slot is taken first, so the process is only killed once no
-/// turn is running against it. Otherwise an in-flight stream would die
-/// mid-token with a transport error rather than a reason.
-async fn unload_model(State(state): State<Shared>) -> Response {
+/// Shared by `/model/unload` and the Ollama keep-alive timer: both must wait
+/// for the scheduler, or an in-flight stream dies mid-token with a transport
+/// error instead of a reason.
+async fn drain_and_unload(state: &Shared) -> std::result::Result<bool, Response> {
     let Some(compute) = &state.compute else {
-        return no_compute();
+        return Err(no_compute());
     };
-
     let drained = tokio::time::timeout(
         std::time::Duration::from_secs(DRAIN_TIMEOUT_S),
         state.permits.clone().acquire_many_owned(KV_SLOTS as u32),
     )
     .await;
-    let _all_slots = match drained {
-        Ok(Ok(permits)) => permits,
-        _ => {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": {
-                    "message": format!(
-                        "turns still running after {DRAIN_TIMEOUT_S}s; nothing unloaded"
-                    ),
-                    "type": "busy"
-                }})),
-            )
-                .into_response()
-        }
+    let Ok(Ok(_all_slots)) = drained else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": {
+                "message": format!("turns still running after {DRAIN_TIMEOUT_S}s; nothing unloaded"),
+                "type": "busy"
+            }})),
+        )
+            .into_response());
     };
-
     let mut c = compute.lock().await;
     let was_loaded = c.unload();
     drop(c);
-    if was_loaded {
+    let extras = state.residents.lock().await.len();
+    state.residents.lock().await.clear();
+    if was_loaded || extras > 0 {
         println!("  model unloaded — VRAM released");
     }
-    Json(json!({ "loaded": false, "changed": was_loaded })).into_response()
+    Ok(was_loaded || extras > 0)
+}
+
+/// POST /model/unload - stop the compute process and give the VRAM back.
+async fn unload_model(State(state): State<Shared>) -> Response {
+    match drain_and_unload(&state).await {
+        Ok(changed) => Json(json!({ "loaded": false, "changed": changed })).into_response(),
+        Err(e) => e,
+    }
+}
+
+/// Token ids for Ollama's deprecated-but-still-used `context` field. Computed
+/// with Strata's own BPE over the prompt the compute process will actually see.
+fn prompt_context(state: &Shared, model: &str, req: &Value) -> Vec<u32> {
+    let path = crate::registry::resolve(&state.models_root, model).or_else(|| {
+        // Under --upstream the client may name a model the local registry does
+        // not know; tokenise with the resident model's vocabulary instead of
+        // silently returning no context.
+        let current = state.model.lock().unwrap().clone();
+        crate::registry::resolve(&state.models_root, &current)
+    });
+    let Some(path) = path else { return Vec::new() };
+    let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&path.to_string_lossy()) else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    if let Some(system) = req.get("system").and_then(Value::as_str) {
+        text.push_str(system);
+        text.push('\n');
+    }
+    if let Some(prompt) = req.get("prompt").and_then(Value::as_str) {
+        text.push_str(prompt);
+    }
+    if let Some(messages) = req.get("messages").and_then(Value::as_array) {
+        for m in messages {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+            let content = m
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            text.push_str(role);
+            text.push_str(": ");
+            text.push_str(content);
+            text.push('\n');
+        }
+    }
+    tok.encode(&text).unwrap_or_default()
+}
+
+/// Remote endpoints registered through `POST /api/connect`, in Ollama's shape.
+fn connections_path() -> std::path::PathBuf {
+    crate::registry::default_root().join("connections.json")
+}
+
+fn load_connections() -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(connections_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn connection_key_for_url(url: &str) -> Option<String> {
+    load_connections()
+        .values()
+        .find(|v| v.get("url").and_then(Value::as_str) == Some(url))
+        .and_then(|v| v.get("key"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn connection_upstream(model: &str) -> Option<String> {
+    load_connections()
+        .get(model)
+        .and_then(|v| v.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// GET/POST/DELETE /api/keys - local API keys, for private networks.
+async fn api_keys_list() -> Json<Value> {
+    Json(json!({ "keys": crate::auth::load_keys() }))
+}
+
+async fn api_keys_add(Json(req): Json<Value>) -> Response {
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.len() < 8 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "key must be at least 8 characters" })),
+        )
+            .into_response();
+    }
+    let mut keys = crate::auth::load_keys();
+    if !keys.iter().any(|k| k == key) {
+        keys.push(key.to_string());
+    }
+    match crate::auth::save_keys(&keys) {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_keys_remove(Json(req): Json<Value>) -> Json<Value> {
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+    let mut keys = crate::auth::load_keys();
+    keys.retain(|k| k != key);
+    if let Err(e) = crate::auth::save_keys(&keys) {
+        return Json(json!({ "error": e.to_string() }));
+    }
+    Json(json!({ "status": "success" }))
+}
+
+/// POST /api/connect - register a remote OpenAI-compatible endpoint as a model.
+async fn api_connect(Json(req): Json<Value>) -> Response {
+    let model = req.get("model").and_then(Value::as_str).unwrap_or("");
+    let url = req.get("url").and_then(Value::as_str).unwrap_or("");
+    if model.is_empty() || !url.starts_with("http://") && !url.starts_with("https://") {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model and an http(s) url are required" })),
+        )
+            .into_response();
+    }
+    let mut all = load_connections();
+    let mut entry = json!({ "url": url.trim_end_matches('/') });
+    if let Some(key) = req.get("key").and_then(Value::as_str) {
+        entry["key"] = json!(key);
+    }
+    all.insert(model.to_string(), entry);
+    let encoded = serde_json::to_string_pretty(&all).unwrap_or_default();
+    match std::fs::write(connections_path(), encoded) {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `None` means the request said nothing; `Some(None)` is Ollama's `-1`
+/// ("keep forever"); `Some(Some(n))` is n seconds.
+fn request_keep_alive(req: &Value) -> Option<Option<u64>> {
+    if req.get("keep_alive").is_some() {
+        return req.get("keep_alive").and_then(keep_alive_seconds);
+    }
+    std::env::var("OLLAMA_KEEP_ALIVE")
+        .ok()
+        .and_then(|s| keep_alive_seconds(&Value::String(s)))
+}
+
+/// Parse Ollama's `keep_alive`: seconds, a duration string, or -1 for forever.
+/// Returns `None` for "leave the current timer alone".
+pub fn keep_alive_seconds(v: &Value) -> Option<Option<u64>> {
+    let raw = match v {
+        Value::Number(n) => n.as_i64()?,
+        Value::String(s) => {
+            let s = s.trim();
+            if s == "-1" {
+                return Some(None);
+            }
+            let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+            let n: i64 = digits.parse().ok()?;
+            match unit {
+                "s" | "" => n,
+                "m" => n * 60,
+                "h" => n * 3600,
+                "d" => n * 86400,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if raw < 0 {
+        return Some(None);
+    }
+    Some(Some(raw as u64))
+}
+
+/// Refresh the unload timer after an Ollama request. A `keep_alive` of 0 is the
+/// documented "unload now" idiom; -1 cancels unloading entirely.
+async fn apply_keep_alive(state: &Shared, req: &Value, model: &str) {
+    let seconds = request_keep_alive(req);
+    if let Some(Some(secs)) = seconds {
+        // A resident can expire on its own without touching the primary. The
+        // deadline check makes a later request's refresh win over this timer.
+        let resident_model = model.to_string();
+        let resident_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let mut residents = resident_state.residents.lock().await;
+            if let Some(i) = residents.iter().position(|r| r.model == resident_model) {
+                let deadline = residents[i].expires_at;
+                if deadline.is_some_and(|d| d <= now_secs()) {
+                    let gone = residents.remove(i);
+                    println!("  {} unloaded after keep_alive", gone.model);
+                }
+            }
+        });
+    }
+    let Some(seconds) = seconds else { return };
+    let gen = state.keep_alive_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match seconds {
+        Some(0) => {
+            *state.keep_alive_deadline.lock().unwrap() = None;
+            drain_and_unload(state).await.ok();
+        }
+        Some(secs) => {
+            *state.keep_alive_deadline.lock().unwrap() = Some(now + secs);
+            let state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                if state.keep_alive_gen.load(Ordering::SeqCst) == gen {
+                    drain_and_unload(&state).await.ok();
+                }
+            });
+        }
+        None => {
+            // -1: stay resident until the console unloads it.
+            *state.keep_alive_deadline.lock().unwrap() = None;
+        }
+    }
 }
 
 /// POST /model/load - start the compute process again.
@@ -747,6 +1012,13 @@ async fn metrics(State(state): State<Shared>) -> String {
         "strata_sched_active {}\n",
         state.sched.active.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP strata_resident_models Models currently loaded.\n");
+    out.push_str("# TYPE strata_resident_models gauge\n");
+    let residents = state.residents.try_lock().map(|r| r.len()).unwrap_or(0);
+    out.push_str(&format!("strata_resident_models {}\n", residents));
+    out.push_str("# HELP strata_resident_capacity Maximum resident models.\n");
+    out.push_str("# TYPE strata_resident_capacity gauge\n");
+    out.push_str(&format!("strata_resident_capacity {}\n", state.max_resident));
     out.push_str("# HELP strata_sched_completed Completed turns.\n");
     out.push_str("# TYPE strata_sched_completed counter\n");
     out.push_str(&format!(
@@ -759,7 +1031,25 @@ async fn metrics(State(state): State<Shared>) -> String {
 /// OpenAI /v1/models - whatever the compute process reports, plus the model
 /// this instance was started with.
 async fn models(State(state): State<Shared>) -> Json<Value> {
-    let mut ids = vec![state.model.lock().unwrap().clone()];
+    // Every installed model, not just the resident one. This endpoint used to
+    // report only `state.model` plus whatever the compute process listed, so a
+    // machine holding several models advertised one and the console's picker
+    // had nothing to pick.
+    let mut ids: Vec<String> = crate::registry::scan(&state.models_root)
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+
+    // The resident model goes first, and is present even when its file is not
+    // in the registry root (an explicit --model path, for instance).
+    let current = state.model.lock().unwrap().clone();
+    if !current.is_empty() {
+        ids.retain(|id| id != &current);
+        ids.insert(0, current);
+    }
+
+    // Anything the compute process itself reports, deduplicated against the
+    // registry rather than appended blindly.
     if let Ok(resp) = state
         .client
         .get(format!("{}/v1/models", state.upstream))
@@ -770,13 +1060,15 @@ async fn models(State(state): State<Shared>) -> Json<Value> {
             if let Some(list) = body.get("data").and_then(|m| m.as_array()) {
                 for m in list {
                     if let Some(id) = m.get("id").and_then(|n| n.as_str()) {
-                        ids.push(id.to_string());
+                        if !ids.iter().any(|existing| existing == id) {
+                            ids.push(id.to_string());
+                        }
                     }
                 }
             }
         }
     }
-    ids.dedup();
+
     let data: Vec<Value> = ids
         .iter()
         .map(|id| json!({ "id": id, "object": "model", "owned_by": "strata" }))
@@ -844,6 +1136,31 @@ async fn api_models_load(State(state): State<Shared>, Json(req): Json<LoadModelR
                 .into_response()
         }
     };
+
+    // With room for more than one resident, a second model is loaded beside
+    // the primary one instead of replacing it. Requests name their model and
+    // are routed to the right process by `ensure_upstream`.
+    if state.max_resident > 1 {
+        let current = state.model.lock().unwrap().clone();
+        if req.model != current && state.compute.is_some() {
+            match load_resident(&state, &req.model, request_keep_alive(&json!({}))).await {
+                Ok(u) => {
+                    println!("  {} resident at {u}", req.model);
+                    return Json(json!({
+                        "ok": true, "model": req.model, "resident": true, "upstream": u,
+                    }))
+                    .into_response();
+                }
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("failed to load {}: {e}", req.model) })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    }
 
     // Wait for in-flight to drain (best effort, up to 30s).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -919,7 +1236,9 @@ async fn api_models_unload(State(state): State<Shared>) -> Json<Value> {
             c.unload();
         }
     }
-    Json(json!({"ok": true}))
+    let cleared = state.residents.lock().await.len();
+    state.residents.lock().await.clear();
+    Json(json!({ "ok": true, "residents_unloaded": cleared }))
 }
 
 /// POST /v1/chat/completions - forwards to the compute process Strata started
@@ -939,6 +1258,19 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
     } else {
         req.model.clone()
     };
+    let keep = request_keep_alive(&Value::Object(req.extra.clone()));
+    apply_keep_alive(&state, &Value::Object(req.extra.clone()), &model).await;
+    let upstream = match ensure_upstream(&state, &model, keep).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let is_extra = upstream != state.upstream;
     let id = format!("chatcmpl-{}", uid());
     let admitted = Instant::now();
     let permit = match admit(&state).await {
@@ -960,11 +1292,13 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
     // holding its scheduler slot - for minutes and then answer as though
     // nothing had happened. Failing to take it means a load or unload is in
     // flight, which is worth saying.
-    if let Some(compute) = &state.compute {
-        match compute.try_lock() {
-            Ok(c) if !c.is_loaded() => return model_unloaded(),
-            Ok(_) => {}
-            Err(_) => return model_busy(),
+    if !is_extra {
+        if let Some(compute) = &state.compute {
+            match compute.try_lock() {
+                Ok(c) if !c.is_loaded() => return model_unloaded(),
+                Ok(_) => {}
+                Err(_) => return model_busy(),
+            }
         }
     }
     let mut guard = TurnGuard::new(state.clone(), permit);
@@ -1000,7 +1334,39 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
     let mut body = Value::Object(req.extra.clone());
     let fields = body.as_object_mut().expect("built from a map");
     fields.insert("model".into(), json!(model));
-    fields.insert("messages".into(), json!(messages));
+
+    // Modelfile overrides are applied at the API boundary: llama.cpp has no
+    // `--system-prompt-file` in the bundled runtime, so a derived model's
+    // SYSTEM and PARAMETER lines have to travel with the request.
+    let defaults = crate::registry::overrides(&state.models_root, &model);
+    let mut turns: Vec<Value> = serde_json::from_value(json!(messages)).unwrap_or_default();
+    if let Some(system) = defaults.get("system").and_then(Value::as_str) {
+        if !turns
+            .iter()
+            .any(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            turns.insert(0, json!({ "role": "system", "content": system }));
+        }
+    }
+    if let Some(params) = defaults.get("parameters").and_then(Value::as_object) {
+        for (key, value) in params {
+            if req.extra.contains_key(key) {
+                continue; // the caller's explicit setting wins
+            }
+            let parsed = value
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(Value::from);
+            let mapped = match key.as_str() {
+                "num_predict" => Some("max_tokens"),
+                other => Some(other),
+            };
+            if let (Some(target), Some(v)) = (mapped, parsed.or_else(|| Some(value.clone()))) {
+                fields.insert(target.into(), v);
+            }
+        }
+    }
+    fields.insert("messages".into(), json!(turns));
     fields.insert("stream".into(), json!(req.stream));
     fields.insert("stream_options".into(), json!({ "include_usage": true }));
     fields.insert("temperature".into(), json!(req.temperature));
@@ -1011,22 +1377,41 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
         "chat_template_kwargs".into(),
         json!({ "enable_thinking": req.enable_thinking }),
     );
+    // Re-apply the two fields Strata owns above, so a Modelfile's PARAMETER
+    // temperature / num_predict is not lost to the defaults.
+    if let Some(params) = defaults.get("parameters").and_then(Value::as_object) {
+        for (key, target) in [("temperature", "temperature"), ("num_predict", "max_tokens")] {
+            if req.extra.contains_key(key) {
+                continue;
+            }
+            if let Some(v) = params.get(key) {
+                let parsed = v
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(Value::from)
+                    .unwrap_or_else(|| v.clone());
+                fields.insert(target.into(), parsed);
+            }
+        }
+    }
 
-    let upstream = state
+    let mut request = state
         .client
-        .post(format!("{}/v1/chat/completions", state.upstream))
-        .json(&body)
-        .send()
-        .await;
+        .post(format!("{upstream}/v1/chat/completions"))
+        .json(&body);
+    if let Some(key) = connection_key_for_url(&upstream) {
+        request = request.bearer_auth(key);
+    }
+    let upstream_result = request.send().await;
     let queue_wait_ms = admitted.elapsed().as_millis() as u64;
 
-    let resp = match upstream {
+    let resp = match upstream_result {
         Ok(r) if r.status().is_success() => r,
         other => {
             guard.reject();
             let detail = match other {
-                Ok(r) => format!("upstream {} from {}", r.status(), state.upstream),
-                Err(e) => format!("cannot reach {} ({e})", state.upstream),
+                Ok(r) => format!("upstream {} from {upstream}", r.status()),
+                Err(e) => format!("cannot reach {upstream} ({e})"),
             };
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
@@ -1039,10 +1424,21 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
         }
     };
 
+    let mut invalid_structured = false;
     let mut response = if !req.stream {
         // The compute process already answers in OpenAI shape; forward it as-is
         // and read the usage block only to record the turn.
         let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        if let Some(format) = req.extra.get("response_format") {
+            let text = body
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !crate::dialects::valid_structured(text, format) {
+                eprintln!("strata: model did not honour the requested response format");
+                invalid_structured = true;
+            }
+        }
         let prompt_tokens = body
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
@@ -1066,6 +1462,9 @@ async fn chat_completions(State(state): State<Shared>, Json(req): Json<ChatReq>)
             headers.insert(name, v);
         }
     };
+    if invalid_structured {
+        tag("x-strata-invalid-structured", "1".into());
+    }
     tag("x-request-id", id);
     tag("x-strata-queue-wait-ms", queue_wait_ms.to_string());
     tag("x-strata-context-tokens", compaction.tokens.to_string());
@@ -1419,7 +1818,11 @@ async fn require_key(
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
     match presented {
-        Some(key) if secret_eq(key.as_bytes(), expected.as_bytes()) => next.run(request).await,
+        Some(key)
+            if secret_eq(key.as_bytes(), expected.as_bytes()) || crate::auth::valid_key(key) =>
+        {
+            next.run(request).await
+        }
         _ => unauthorized(),
     }
 }
@@ -1472,6 +1875,7 @@ pub struct ServeOptions {
     pub devices: Option<String>,
     pub tensor_split: Option<String>,
     pub backend: Option<String>,
+    pub embeddings: bool,
 }
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
@@ -1490,6 +1894,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         devices,
         tensor_split,
         backend,
+        embeddings,
     } = opts;
 
     // A public address with no key hands the GPU to anything that can reach the
@@ -1507,7 +1912,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
 
     let path = crate::placement::resolve_path(&model);
     let placed = path.as_ref().and_then(|p| {
-        let vram = (crate::rocm::vram_total_gb() as f64 * 1024.0 * 1024.0 * 1024.0) as u64;
+        let vram = vram_budget_bytes();
         let ram = 20u64 * 1024 * 1024 * 1024;
         crate::placement::Placement::solve(p, ctx, vram, ram).ok()
     });
@@ -1560,6 +1965,18 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             flags.mmproj = mmproj.as_ref().map(std::path::PathBuf::from);
             flags.devices = devices.clone();
             flags.tensor_split = tensor_split.clone();
+            let defaults = crate::registry::overrides(&crate::registry::default_root(), &model);
+            flags.chat_template = defaults
+                .get("template")
+                .and_then(Value::as_str)
+                .and_then(usable_jinja_template);
+            flags.lora_adapter = defaults
+                .get("adapter")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from);
+            flags.embeddings = embeddings;
+            flags.batch = std::env::var("OLLAMA_BATCH").ok().and_then(|s| s.parse().ok());
+            flags.ubatch = std::env::var("OLLAMA_UBATCH").ok().and_then(|s| s.parse().ok());
             // Auto-detect mmproj if not given.
             if flags.mmproj.is_none() {
                 if let Some(p) = &placed {
@@ -1589,18 +2006,48 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 // Absent in every measurement taken so far, and absent means
                 // the `-ncmoe` path, unchanged.
                 flags.expert_override = t.expert_override.clone();
+                if let Some(n) = t.gpu_layers {
+                    flags.gpu_layers = n;
+                }
                 source = "measured by `strata tune`";
             }
             if let Some(n) = cpu_moe {
-                flags.cpu_moe_layers = n;
+                if p.expert_count == 0 {
+                    // Dense models have no experts: the equivalent knob is how
+                    // many whole layers stay on the GPU.
+                    flags.gpu_layers = p.facts.layers.saturating_sub(n);
+                    flags.cpu_moe_layers = 0;
+                } else {
+                    flags.cpu_moe_layers = n;
+                }
                 source = "set on the command line";
+            }
+            // Ollama-compatible environment overrides, applied last so an
+            // explicit CLI flag still wins.
+            if let Some(n) = std::env::var("OLLAMA_NUM_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+            {
+                flags.threads = n;
+            }
+            if let Some(v) = std::env::var("OLLAMA_FLASH_ATTENTION").ok() {
+                flags.flash_attention = matches!(v.as_str(), "1" | "true" | "TRUE" | "on");
+            }
+            if flags.devices.is_none()
+                && std::env::var("OLLAMA_SCHED_SPREAD")
+                    .ok()
+                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on"))
+            {
+                flags.devices = Some(detected_device_ids().join(","));
             }
             println!("Loading {}", model_path.display());
             println!(
-                "  ctx {}  |  cpu-expert layers {}/{}  |  flash-attn {}  |  KV {}  |  {} threads",
+                "  ctx {}  |  gpu layers {}/{}  |  cpu-expert layers {}  |  flash-attn {}  |  KV {}  |  {} threads",
                 flags.ctx,
-                flags.cpu_moe_layers,
+                flags.gpu_layers,
                 p.facts.layers,
+                flags.cpu_moe_layers,
                 flags.flash_attention,
                 flags.kv_type.as_deref().unwrap_or("f16"),
                 flags.threads
@@ -1640,7 +2087,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let compactor = crate::compact::Compactor::new(ctx, endpoint.clone(), client.clone(), compact);
+    let compactor = crate::compact::Compactor::new(ctx, endpoint.clone(), client.clone(), compact)
+        .with_tokenizer(path.as_deref());
 
     println!("Serving strata on http://{listen}");
     match (&api_key, is_loopback(&listen)) {
@@ -1670,6 +2118,13 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         models_root: crate::registry::default_root(),
         api_key: api_key.clone(),
         compute,
+        keep_alive_gen: AtomicU64::new(0),
+        keep_alive_deadline: Mutex::new(None),
+        residents: tokio::sync::Mutex::new(Vec::new()),
+        max_resident: default_resident_capacity(crate::rocm::vram_total_gb()),
+        default_ctx: ctx,
+        default_kv_type: kv_type.clone(),
+        default_backend: selected_backend,
         compactor,
         upstream: endpoint,
         client,
@@ -1721,6 +2176,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .route("/api/models/unload", post(api_models_unload))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(openai_completions))
+        .route("/v1/responses", post(openai_responses))
         // Harness compatibility. Claude Code speaks the Anthropic Messages API
         // and Ollama's native clients speak /api/*; neither falls back when the
         // endpoint answers in the wrong shape, so both dialects are served here
@@ -1731,6 +2188,19 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .route("/api/tags", get(ollama_tags))
         .route("/api/ps", get(ollama_ps))
         .route("/api/show", post(ollama_show))
+        .route("/api/copy", post(ollama_copy))
+        .route("/api/delete", delete(ollama_delete))
+        .route("/api/create", post(ollama_create))
+        .route("/api/pull", post(ollama_pull))
+        .route("/api/push", post(ollama_push))
+        .route(
+            "/api/blobs/:digest",
+            head(blob_head).post(blob_post),
+        )
+        .route("/api/embed", post(ollama_embed))
+        .route("/api/embeddings", post(ollama_embeddings))
+        .route("/api/connect", post(api_connect))
+        .route("/api/keys", get(api_keys_list).post(api_keys_add).delete(api_keys_remove))
         .route("/api/version", get(ollama_version))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1820,6 +2290,107 @@ async fn wait_for_signal() {
 }
 
 #[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state() -> Shared {
+        let client = reqwest::Client::new();
+        Arc::new(AppState {
+            model: std::sync::Mutex::new("test-model".into()),
+            placement: None,
+            models_root: std::path::PathBuf::from("rocm/models"),
+            upstream: "http://127.0.0.1:1".into(),
+            client: client.clone(),
+            hw: Hw { cores: 1, cpu: "test".into(), gpu: "test".into(), gpus: 0, vram_total_gb: 0.0 },
+            vram_gb: 0.0,
+            ram_gb: 0.0,
+            sched: Sched::default(),
+            metrics: Metrics::default(),
+            profile: Mutex::new(Vec::new()),
+            experts: Mutex::new(Experts::new(1, 1, 1, 0.0, 0.0)),
+            permits: Arc::new(tokio::sync::Semaphore::new(KV_SLOTS)),
+            compactor: crate::compact::Compactor::new(8192, "http://127.0.0.1:1".into(), client, false),
+            api_key: None,
+            compute: None,
+            keep_alive_gen: AtomicU64::new(0),
+            keep_alive_deadline: Mutex::new(None),
+            residents: tokio::sync::Mutex::new(Vec::new()),
+            max_resident: 1,
+            default_ctx: 8192,
+            default_kv_type: None,
+            default_backend: crate::backend::Backend::LlamaCpp,
+        })
+    }
+
+    async fn fetch(app: Router, path: &str) -> (axum::http::StatusCode, Value) {
+        let resp = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_returns_ollama_shape() {
+        let app = Router::new()
+            .route("/api/version", get(ollama_version))
+            .with_state(test_state());
+        let (status, body) = fetch(app, "/api/version").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(!body["version"].as_str().unwrap_or("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ps_endpoint_reports_an_empty_list_when_nothing_is_loaded() {
+        let app = Router::new()
+            .route("/api/ps", get(ollama_ps))
+            .with_state(test_state());
+        let (status, body) = fetch(app, "/api/ps").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body["models"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tags_metrics_and_compact_routes_answer() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/api/tags", get(ollama_tags))
+            .route("/metrics", get(metrics))
+            .route("/compact", get(compaction))
+            .with_state(state);
+        let (status, body) = fetch(app.clone(), "/api/tags").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body["models"].is_array());
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let (status, body) = fetch(app, "/compact").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.get("enabled").is_some());
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_admits_it_is_simulated() {
+        let app = Router::new()
+            .route("/health", get(health))
+            .with_state(test_state());
+        let (status, body) = fetch(app, "/health").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["simulated"], true);
+        assert_eq!(body["status"], "ok");
+    }
+}
+
+#[cfg(test)]
 mod access_tests {
     use super::*;
 
@@ -1865,6 +2436,64 @@ mod access_tests {
         assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
         assert_ne!(key, suggest_key(), "two suggestions should differ");
     }
+
+    #[test]
+    fn keep_alive_accepts_every_shape_ollama_sends() {
+        assert_eq!(keep_alive_seconds(&json!(0)), Some(Some(0)));
+        assert_eq!(keep_alive_seconds(&json!(30)), Some(Some(30)));
+        assert_eq!(keep_alive_seconds(&json!("5m")), Some(Some(300)));
+        assert_eq!(keep_alive_seconds(&json!("2h")), Some(Some(7200)));
+        assert_eq!(keep_alive_seconds(&json!("10s")), Some(Some(10)));
+        assert_eq!(keep_alive_seconds(&json!(-1)), Some(None));
+        assert_eq!(keep_alive_seconds(&json!("-1")), Some(None));
+        assert_eq!(keep_alive_seconds(&json!("nonsense")), None);
+    }
+
+    #[test]
+    fn ollama_go_templates_are_not_sent_to_the_jinja_engine() {
+        assert!(usable_jinja_template("{{ .Prompt }}").is_none());
+        assert!(usable_jinja_template("{{- $last := eq 1 1 }}").is_none());
+        assert!(usable_jinja_template("{% for message in messages %}{{ message.content }}{% endfor %}").is_some());
+        assert!(usable_jinja_template("").is_none());
+    }
+
+    #[test]
+    fn keep_alive_precedence_is_request_then_environment() {
+        std::env::remove_var("OLLAMA_KEEP_ALIVE");
+        assert_eq!(request_keep_alive(&json!({})), None);
+        assert_eq!(request_keep_alive(&json!({ "keep_alive": "2m" })), Some(Some(120)));
+        assert_eq!(request_keep_alive(&json!({ "keep_alive": -1 })), Some(None));
+        std::env::set_var("OLLAMA_KEEP_ALIVE", "10m");
+        assert_eq!(request_keep_alive(&json!({})), Some(Some(600)));
+        assert_eq!(request_keep_alive(&json!({ "keep_alive": "1m" })), Some(Some(60)));
+        std::env::remove_var("OLLAMA_KEEP_ALIVE");
+    }
+
+    #[test]
+    fn resident_capacity_scales_with_vram() {
+        std::env::remove_var("OLLAMA_MAX_LOADED_MODELS");
+        assert_eq!(default_resident_capacity(8.0), 1);
+        assert_eq!(default_resident_capacity(16.0), 1);
+        assert_eq!(default_resident_capacity(32.0), 2);
+        assert_eq!(default_resident_capacity(64.0), 4);
+        std::env::set_var("OLLAMA_MAX_LOADED_MODELS", "3");
+        assert_eq!(default_resident_capacity(4.0), 3);
+        std::env::remove_var("OLLAMA_MAX_LOADED_MODELS");
+    }
+
+    #[test]
+    fn embed_inputs_read_both_ollama_field_names() {
+        assert_eq!(
+            embed_inputs(&json!({ "input": "hello" }), false),
+            vec!["hello"]
+        );
+        assert_eq!(
+            embed_inputs(&json!({ "prompt": "hello" }), true),
+            vec!["hello"]
+        );
+        let mixed = json!({ "input": ["a", { "text": "b" }, 7] });
+        assert_eq!(embed_inputs(&mixed, false), vec!["a", "b"]);
+    }
 }
 
 // ------------------------------------------------- harness compatibility
@@ -1882,6 +2511,16 @@ async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>)
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let body = match crate::anthropic::request_to_openai(&req) {
@@ -1889,13 +2528,14 @@ async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>)
         Err(e) => return anthropic_error(400, &format!("invalid request: {e}")),
     };
 
-    let resp = match state
+    let mut request = state
         .client
-        .post(format!("{}/v1/chat/completions", state.upstream))
-        .json(&body)
-        .send()
-        .await
-    {
+        .post(format!("{upstream}/v1/chat/completions"))
+        .json(&body);
+    if let Some(key) = connection_key_for_url(&upstream) {
+        request = request.bearer_auth(key);
+    }
+    let resp = match request.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => return anthropic_error(502, &format!("compute process returned {}", r.status())),
         Err(e) => return anthropic_error(502, &format!("cannot reach compute process ({e})")),
@@ -1970,13 +2610,35 @@ async fn ollama_generate(State(state): State<Shared>, Json(req): Json<Value>) ->
 }
 
 /// Shared path for both Ollama endpoints: translate, forward, translate back.
-async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
+async fn ollama_forward(state: Shared, mut req: Value, chat: bool) -> Response {
+    if req.get("keep_alive").is_none() {
+        if let Ok(keep) = std::env::var("OLLAMA_KEEP_ALIVE") {
+            if !keep.trim().is_empty() {
+                if let Some(obj) = req.as_object_mut() {
+                    obj.insert("keep_alive".into(), json!(keep));
+                }
+            }
+        }
+    }
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    apply_keep_alive(&state, &req, &model).await;
+    let context = prompt_context(&state, &model, &req);
+    let started = Instant::now();
 
     let body = match if chat {
         crate::ollama::chat_to_openai(&req)
@@ -1993,13 +2655,14 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
         }
     };
 
-    let resp = match state
+    let mut request = state
         .client
-        .post(format!("{}/v1/chat/completions", state.upstream))
-        .json(&body)
-        .send()
-        .await
-    {
+        .post(format!("{upstream}/v1/chat/completions"))
+        .json(&body);
+    if let Some(key) = connection_key_for_url(&upstream) {
+        request = request.bearer_auth(key);
+    }
+    let resp = match request.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             return (
@@ -2032,10 +2695,12 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
             .and_then(|v| v.as_str())
             .unwrap_or("stop");
         let usage = body.get("usage").cloned().unwrap_or_else(|| json!({}));
-        return Json(crate::ollama::complete(
-            &model, chat, &message, finish, &usage,
-        ))
-        .into_response();
+        let mut out = crate::ollama::complete(&model, chat, &message, finish, &usage);
+        if !context.is_empty() {
+            out.as_object_mut().unwrap().insert("context".into(), json!(context));
+        }
+        add_durations(&mut out, started.elapsed(), None);
+        return Json(out).into_response();
     }
 
     // Ollama streams newline-delimited JSON, not SSE. Each line is one object.
@@ -2044,6 +2709,7 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
         let mut buf = String::new();
         let mut usage = json!({});
         let mut finish = "stop".to_string();
+        let mut first: Option<std::time::Duration> = None;
         loop {
             let Some(chunk) = inner.next().await else { break };
             let Ok(bytes) = chunk else { break };
@@ -2077,6 +2743,12 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
                         finish = r.to_string();
                     }
                     if let Some(delta) = choice.get("delta") {
+                        let has_text = delta.get("content").and_then(Value::as_str)
+                            .or_else(|| delta.get("reasoning_content").and_then(Value::as_str))
+                            .is_some_and(|s| !s.is_empty());
+                        if has_text && first.is_none() {
+                            first = Some(started.elapsed());
+                        }
                         let out = if chat {
                             crate::ollama::chat_chunk(delta, &model, false)
                         } else {
@@ -2089,7 +2761,11 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
                 }
             }
         }
-        let last = crate::ollama::final_chunk(&model, chat, &finish, &usage);
+        let mut last = crate::ollama::final_chunk(&model, chat, &finish, &usage);
+        if !context.is_empty() {
+            last.as_object_mut().unwrap().insert("context".into(), json!(context));
+        }
+        add_durations(&mut last, started.elapsed(), first);
         yield Ok(Event::default().data(format!("{last}\n")));
     };
     Sse::new(stream)
@@ -2097,12 +2773,858 @@ async fn ollama_forward(state: Shared, req: Value, chat: bool) -> Response {
         .into_response()
 }
 
+/// Send an already-translated chat request to the compute process.
+///
+/// Every dialect adapter ends up here, so a dead compute process produces one
+/// honest gateway error rather than a different shape per endpoint.
+async fn upstream_chat(
+    state: &Shared,
+    upstream: &str,
+    body: Value,
+) -> std::result::Result<reqwest::Response, Response> {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        let mut request = state
+            .client
+            .post(format!("{upstream}/v1/chat/completions"))
+            .json(&body);
+        if let Some(key) = connection_key_for_url(&upstream) {
+            request = request.bearer_auth(key);
+        }
+        match request.send().await {
+            Ok(r) if r.status().is_success() => return Ok(r),
+            Ok(r) => last_error = format!("compute process returned {}", r.status()),
+            Err(e) => last_error = format!("cannot reach compute process ({e})"),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 << attempt)).await;
+        }
+    }
+    Err((
+        axum::http::StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": last_error })),
+    )
+        .into_response())
+}
+
+/// How many models may stay resident at once. An explicit
+/// `OLLAMA_MAX_LOADED_MODELS` wins; otherwise VRAM decides, conservatively,
+/// because two 20 GB experts do not fit on a 16 GB card however many slots the
+/// scheduler would like to offer.
+fn default_resident_capacity(vram_gb: f32) -> usize {
+    if let Some(n) = std::env::var("OLLAMA_MAX_LOADED_MODELS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+    {
+        return n;
+    }
+    if vram_gb >= 48.0 {
+        4
+    } else if vram_gb >= 24.0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Only pass a template to llama.cpp when it is Jinja. Ollama manifests carry
+/// Go-template syntax (`{{ .Prompt }}`, `{{- $last := ... }}`), which the
+/// runtime's lexer rejects outright. Those templates are kept in strata.json
+/// for `show`, but the model's own embedded chat template is used instead.
+fn usable_jinja_template(text: &str) -> Option<String> {
+    let go_markers = ["{{.", "{{ .", "{{- $", "{{ $", "range ", ".Prompt", ".System", ".Response"];
+    if go_markers.iter().any(|m| text.contains(m)) {
+        return None;
+    }
+    let text = text.trim();
+    if text.is_empty() { None } else { Some(text.to_string()) }
+}
+
+fn detected_device_ids() -> Vec<String> {
+    let Some(runtime) = crate::runner::Runtime::discover() else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(&runtime.server)
+        .arg("--list-devices")
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("ROCm") || l.contains("CUDA") || l.contains("Vulkan"))
+        .filter_map(|l| l.split(':').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn vram_budget_bytes() -> u64 {
+    let total = (crate::rocm::vram_total_gb() as f64 * 1024.0 * 1024.0 * 1024.0) as u64;
+    let overhead = std::env::var("OLLAMA_GPU_OVERHEAD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1024 * 1024);
+    total.saturating_sub(overhead)
+}
+
+fn placement_budgets() -> (u64, u64) {
+    (vram_budget_bytes(), 20u64 * 1024 * 1024 * 1024)
+}
+
+fn free_port() -> u16 {
+    (1..32)
+        .filter_map(|_| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            l.local_addr().ok().map(|a| a.port())
+        })
+        .find(|p| *p > 0)
+        .unwrap_or(18_000)
+}
+
+/// Load a second (or third…) model beside the primary one and return its
+/// upstream URL. The least-recently-used resident is unloaded first.
+async fn load_resident(
+    state: &Shared,
+    model: &str,
+    keep_alive: Option<Option<u64>>,
+) -> Result<String> {
+    let path = crate::registry::resolve(&state.models_root, model)
+        .ok_or_else(|| anyhow::anyhow!("model '{model}' not found"))?;
+    let (vram, ram) = placement_budgets();
+    let placement = crate::placement::Placement::solve(&path, state.default_ctx, vram, ram)?;
+    let mut flags = crate::runner::Flags::derive(&placement);
+    flags.kv_type = state.default_kv_type.clone();
+    let overrides = crate::registry::overrides(&state.models_root, model);
+    flags.chat_template = overrides
+        .get("template")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let port = free_port();
+    let mut compute = Compute {
+        runner: None,
+        model_path: path,
+        flags,
+        backend: state.default_backend,
+        port,
+    };
+    compute.load().await?;
+    let upstream = format!("http://127.0.0.1:{port}");
+
+    let mut residents = state.residents.lock().await;
+    if residents.len() >= state.max_resident {
+        let victim = residents
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| r.last_used)
+            .map(|(i, _)| i);
+        if let Some(i) = victim {
+            let gone = residents.remove(i);
+            println!("  evicted {} from the resident pool", gone.model);
+        }
+    }
+    let secs = keep_alive.and_then(|v| v);
+    let expires_at = secs.map(|s| now_secs() + s);
+    residents.push(Resident {
+        model: model.to_string(),
+        compute,
+        upstream: upstream.clone(),
+        last_used: Instant::now(),
+        keep_alive_secs: secs,
+        expires_at,
+    });
+    Ok(upstream)
+}
+
+/// Where a request for `model` should go: an additional resident if one holds
+/// it, otherwise the primary compute process / external upstream.
+async fn ensure_upstream(
+    state: &Shared,
+    model: &str,
+    keep_alive: Option<Option<u64>>,
+) -> Result<String> {
+    if let Some(url) = connection_upstream(model) {
+        return Ok(url);
+    }
+    {
+        let mut residents = state.residents.lock().await;
+        if let Some(r) = residents.iter_mut().find(|r| r.model == model) {
+            r.last_used = Instant::now();
+            let secs = match keep_alive {
+                Some(v) => v,
+                None => r.keep_alive_secs,
+            };
+            r.keep_alive_secs = secs;
+            r.expires_at = secs.map(|s| now_secs() + s);
+            return Ok(r.upstream.clone());
+        }
+    }
+    let current = state.model.lock().unwrap().clone();
+    if model.is_empty()
+        || model == current
+        || state.compute.is_none()
+        || state.max_resident <= 1
+    {
+        return Ok(state.upstream.clone());
+    }
+    load_resident(state, model, keep_alive).await
+}
+
+/// Ollama reports every duration in nanoseconds. Strata measures wall time and
+/// time-to-first-token at the API boundary; there is no separate load phase to
+/// report once the compute process is already resident.
+fn add_durations(out: &mut Value, total: std::time::Duration, first: Option<std::time::Duration>) {
+    let Some(obj) = out.as_object_mut() else { return };
+    let total_ns = total.as_nanos() as u64;
+    obj.insert("total_duration".into(), json!(total_ns));
+    obj.insert("load_duration".into(), json!(0));
+    obj.insert("prompt_eval_duration".into(), json!(first.map(|d| d.as_nanos() as u64).unwrap_or(0)));
+    obj.insert(
+        "eval_duration".into(),
+        json!(total_ns.saturating_sub(first.map(|d| d.as_nanos() as u64).unwrap_or(0))),
+    );
+}
+
+fn dialect_id(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}_{nanos:x}")
+}
+
+/// POST /v1/completions - OpenAI's legacy text-completion dialect.
+async fn openai_completions(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let id = dialect_id("cmpl");
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = match crate::dialects::completions_to_chat(&req) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let resp = match upstream_chat(&state, &upstream, body).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if !stream {
+        let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        return Json(crate::dialects::chat_to_completions(
+            &body, &model, &id, created,
+        ))
+        .into_response();
+    }
+
+    let mut inner = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buf = String::new();
+        loop {
+            let Some(chunk) = inner.next().await else { break };
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" { continue }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+                    let delta = v.get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| c.first())
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| {
+                            d.get("content")
+                                .or_else(|| d.get("reasoning_content"))
+                                .or_else(|| d.get("reasoning"))
+                        })
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let finish = v.get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| c.first())
+                        .and_then(|c| c.get("finish_reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !delta.is_empty() || !finish.is_empty() {
+                        let out = json!({
+                            "id": id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "text": delta,
+                                "logprobs": null,
+                                "finish_reason": if finish.is_empty() { Value::Null } else { Value::String(finish.into()) },
+                            }],
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(out.to_string()));
+                    }
+                }
+            }
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// POST /v1/responses - the OpenAI Responses API Ollama 0.40 also speaks.
+async fn openai_responses(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let id = dialect_id("resp");
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = match crate::dialects::responses_to_chat(&req) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let resp = match upstream_chat(&state, &upstream, body).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if !stream {
+        let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        return Json(crate::dialects::chat_to_response(
+            &body, &model, &id, created,
+        ))
+        .into_response();
+    }
+
+    let mut inner = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buf = String::new();
+        let mut text = String::new();
+        let mut usage = json!({});
+        let start = crate::dialects::chat_to_response(&json!({}), &model, &id, created);
+        yield Ok::<_, Infallible>(crate::dialects::response_event(
+            "response.created",
+            &json!({ "type": "response.created", "response": start }),
+        ));
+        // The item exists from the moment the response is created, even if
+        // the model emits no visible text (a tool call or a pure refusal).
+        yield Ok(crate::dialects::response_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "message", "id": format!("msg_{id}"),
+                    "status": "in_progress", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "" }],
+                },
+            }),
+        ));
+        loop {
+            let Some(chunk) = inner.next().await else { break };
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buf.find("\n\n") {
+                let frame: String = buf.drain(..pos + 2).collect();
+                for line in frame.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" { continue }
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+                    if let Some(u) = v.get("usage") {
+                        if u.get("completion_tokens").is_some() { usage = u.clone(); }
+                    }
+                    let delta = v.get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| c.first())
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| {
+                            d.get("content")
+                                .or_else(|| d.get("reasoning_content"))
+                                .or_else(|| d.get("reasoning"))
+                        })
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if delta.is_empty() { continue }
+                    text.push_str(delta);
+                    let event = json!({
+                        "type": "response.output_text.delta",
+                        "item_id": format!("msg_{id}"),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": delta,
+                    });
+                    yield Ok(crate::dialects::response_event(
+                        "response.output_text.delta",
+                        &event,
+                    ));
+                }
+            }
+        }
+        yield Ok(crate::dialects::response_event(
+            "response.output_text.done",
+            &json!({
+                "type": "response.output_text.done",
+                "item_id": format!("msg_{id}"),
+                "output_index": 0,
+                "content_index": 0,
+                "text": text.clone(),
+            }),
+        ));
+        yield Ok(crate::dialects::response_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": format!("msg_{id}"),
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": text.clone() }],
+                },
+            }),
+        ));
+        let done = crate::dialects::chat_to_response(
+            &json!({
+                "choices": [{ "message": { "content": text } }],
+                "usage": usage,
+            }),
+            &model,
+            &id,
+            created,
+        );
+        yield Ok(crate::dialects::response_event(
+            "response.completed",
+            &json!({ "type": "response.completed", "response": done }),
+        ));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Extract embedding inputs from either Ollama's `input` or the legacy
+/// `prompt` field. A single string stays a single string; a list may mix plain
+/// text with objects carrying `text`.
+fn embed_inputs(req: &Value, legacy: bool) -> Vec<String> {
+    let raw = req.get(if legacy { "prompt" } else { "input" });
+    let mut out = Vec::new();
+    match raw {
+        Some(Value::String(s)) => out.push(s.clone()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    Value::Object(o) => {
+                        if let Some(s) = o.get("text").and_then(Value::as_str) {
+                            out.push(s.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// POST /api/embed and the legacy /api/embeddings.
+///
+/// llama.cpp exposes embeddings at `/v1/embeddings` in recent builds and at
+/// `/embedding` in older ones. Try the OpenAI shape first and fall back on a
+/// 404, so one Strata binary works with either runtime.
+async fn embed_forward(state: Shared, req: Value, legacy: bool) -> Response {
+    let model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let inputs = embed_inputs(&req, legacy);
+    if inputs.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "input (or prompt) must contain some text" })),
+        )
+            .into_response();
+    }
+    let upstream = match ensure_upstream(&state, &model, request_keep_alive(&req)).await {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    apply_keep_alive(&state, &req, &model).await;
+    let mut body = json!({ "model": model, "input": inputs });
+    if let Some(d) = req.get("dimensions").and_then(Value::as_u64) {
+        body["dimensions"] = json!(d);
+    }
+    if let Some(t) = req.get("truncate").and_then(Value::as_bool) {
+        body["truncate"] = json!(t);
+    }
+    let mut resp = match state
+        .client
+        .post(format!("{upstream}/v1/embeddings"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("cannot reach compute process ({e})") })),
+            )
+                .into_response()
+        }
+    };
+    if resp.status() == axum::http::StatusCode::NOT_FOUND {
+        let content = if legacy {
+            json!(inputs[0])
+        } else {
+            json!(inputs)
+        };
+        let old = json!({ "content": content });
+        match state
+            .client
+            .post(format!("{upstream}/embedding"))
+            .json(&old)
+            .send()
+            .await
+        {
+            Ok(r) => resp = r,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("cannot reach compute process ({e})") })),
+                )
+                    .into_response()
+            }
+        }
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return (
+            status,
+            Json(json!({ "error": format!("compute process returned {status}: {text}") })),
+        )
+            .into_response();
+    }
+    let body = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let vectors: Vec<Value> = if let Some(data) = body.get("data").and_then(Value::as_array) {
+        data.iter().filter_map(|d| d.get("embedding").cloned()).collect()
+    } else if let Some(v) = body.get("embeddings").and_then(Value::as_array) {
+        v.clone()
+    } else if let Some(v) = body.get("embedding") {
+        vec![v.clone()]
+    } else {
+        Vec::new()
+    };
+    if legacy {
+        Json(json!({ "embedding": vectors.first().cloned().unwrap_or(json!([])) })).into_response()
+    } else {
+        Json(json!({ "model": model, "embeddings": vectors })).into_response()
+    }
+}
+
+async fn ollama_embed(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    embed_forward(state, req, false).await
+}
+
+async fn ollama_embeddings(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    embed_forward(state, req, true).await
+}
+
+/// POST /api/copy - give an installed model a second name.
+async fn ollama_copy(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let source = req.get("source").and_then(Value::as_str).unwrap_or("");
+    let destination = req
+        .get("destination")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match crate::registry::copy(&state.models_root, source, destination) {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/delete - remove a model from this machine.
+async fn ollama_delete(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let name = req.get("model").and_then(Value::as_str).unwrap_or("");
+    if state.model.lock().unwrap().as_str() == name {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "error": "unload the model before deleting it" })),
+        )
+            .into_response();
+    }
+    match crate::registry::remove(&state.models_root, name) {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/create - derive a named model from one already installed.
+async fn ollama_create(State(state): State<Shared>, Json(req): Json<Value>) -> Response {
+    let name = req.get("model").and_then(Value::as_str).unwrap_or("");
+    let from = req.get("from").and_then(Value::as_str).unwrap_or("");
+    let files = req
+        .get("files")
+        .and_then(Value::as_object)
+        .cloned();
+    if files.is_none() && from.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "create needs either `from` or `files`" })),
+        )
+            .into_response();
+    }
+    let mut overrides = serde_json::Map::new();
+    for key in ["system", "template", "renderer", "parser", "license", "parameters", "messages"] {
+        if let Some(v) = req.get(key) {
+            overrides.insert(key.into(), v.clone());
+        }
+    }
+    let result = match files {
+        Some(f) => crate::registry::create_from_blobs(
+            &state.models_root,
+            name,
+            &f,
+            &Value::Object(overrides),
+        ),
+        None => crate::registry::create_from(
+            &state.models_root,
+            name,
+            from,
+            &Value::Object(overrides),
+        ),
+    };
+    match result {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/pull - the CLI's pull path, with Ollama's streaming status shape.
+async fn ollama_pull(Json(req): Json<Value>) -> Response {
+    let model = req.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    if model.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model is required" })),
+        )
+            .into_response();
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let progress_tx = tx.clone();
+    let hub = crate::hub::Hub::with_progress(move |line| {
+        let _ = progress_tx.send(line);
+    });
+    let pull_model = model.clone();
+    tokio::spawn(async move {
+        match hub.pull(&pull_model).await {
+            Ok(_) => {
+                let _ = tx.send("success".into());
+            }
+            Err(e) => {
+                let _ = tx.send(format!("error: {e}"));
+            }
+        }
+    });
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(
+            http_body::Frame::data(bytes::Bytes::from_static(b"{\"status\":\"pulling manifest\"}\n"))
+        );
+        while let Some(line) = rx.recv().await {
+            let value = if line == "success" {
+                json!({ "status": "success" })
+            } else if let Some(error) = line.strip_prefix("error: ") {
+                json!({ "error": error })
+            } else {
+                json!({ "status": line })
+            };
+            yield Ok(http_body::Frame::data(bytes::Bytes::from(format!("{value}\n"))));
+        }
+    };
+    let body = axum::body::Body::new(http_body_util::StreamBody::new(stream));
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        body,
+    )
+        .into_response()
+}
+
+/// POST /api/push - push a model to the registry configured on this machine.
+async fn ollama_push(Json(req): Json<Value>) -> Response {
+    let name = req.get("model").and_then(Value::as_str).unwrap_or("");
+    match crate::push::push(name, None, None, false).await {
+        Ok(()) => Json(json!({ "status": "success" })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// HEAD /api/blobs/:digest - does this blob exist already?
+async fn blob_head(
+    State(state): State<Shared>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+) -> Response {
+    let path = match crate::blob::blob_path(&state.models_root, &digest) {
+        Ok(p) => p,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+    };
+    if path.exists() {
+        axum::http::StatusCode::OK.into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// POST /api/blobs/:digest - upload a blob, verifying its digest before it is
+/// given a content-addressed name.
+async fn blob_post(
+    State(state): State<Shared>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+    body: axum::body::Body,
+) -> Response {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncWriteExt;
+
+    let hex = match crate::blob::parse_digest(&digest) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let dir = crate::blob::blob_dir(&state.models_root);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    let tmp = dir.join(format!("sha256-{hex}.partial"));
+    let final_path = dir.join(format!("sha256-{hex}"));
+    if final_path.exists() {
+        return axum::http::StatusCode::CREATED.into_response();
+    }
+    let mut body: Body = body;
+    let result: anyhow::Result<()> = async {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            let bytes = frame
+                .into_data()
+                .map_err(|_| anyhow::anyhow!("trailers are not supported in a blob upload"))?;
+            file.write_all(&bytes).await?;
+        }
+        file.flush().await?;
+        drop(file);
+        let hash_path = tmp.clone();
+        let got = tokio::task::spawn_blocking(move || {
+            crate::blob::sha256_hex(std::fs::File::open(&hash_path)?)
+        })
+        .await??;
+        anyhow::ensure!(got == hex, "digest mismatch: got {got}, expected {hex}");
+        std::fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => axum::http::StatusCode::CREATED.into_response(),
+        Err(e) => {
+            std::fs::remove_file(crate::blob::blob_dir(&state.models_root).join(format!(
+                "sha256-{hex}.partial"
+            )))
+            .ok();
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /api/tags - the model list Ollama clients expect.
 async fn ollama_tags(State(state): State<Shared>) -> Json<Value> {
     let entries = crate::registry::scan(&state.models_root);
     let models: Vec<Value> = entries
         .iter()
-        .map(|e| crate::ollama::tag_entry(&e.id, &e.arch, e.file_bytes, e.context, e.is_moe))
+        .map(crate::ollama::tag_entry)
         .collect();
     Json(json!({ "models": models }))
 }
@@ -2115,26 +3637,57 @@ async fn ollama_version() -> Json<Value> {
 /// GET /api/ps - what is loaded right now.
 async fn ollama_ps(State(state): State<Shared>) -> Json<Value> {
     let current = state.model.lock().unwrap().clone();
+    let entries = crate::registry::scan(&state.models_root);
+    let expires = state
+        .keep_alive_deadline
+        .lock()
+        .unwrap()
+        .map(crate::ollama::iso_utc);
+    let mut models: Vec<Value> = Vec::new();
+
     let loaded = state
         .compute
         .as_ref()
         .map(|c| c.try_lock().map(|g| g.is_loaded()).unwrap_or(true))
         .unwrap_or(false);
-    if !loaded {
-        return Json(json!({ "models": [] }));
+    if loaded {
+        if let Some(entry) = entries.iter().find(|e| e.id == current) {
+            models.push(json!({
+                "name": current,
+                "model": current,
+                "size": entry.file_bytes,
+                "digest": entry.digest,
+                "details": crate::ollama::details(entry),
+                "vram": (state.vram_gb * 1_000_000_000.0) as u64,
+                "expires_at": expires,
+            }));
+        } else {
+            models.push(json!({
+                "name": current,
+                "model": current,
+                "size": 0,
+                "digest": "strata-external",
+                "details": { "format": "gguf", "family": "unknown" },
+                "vram": (state.vram_gb * 1_000_000_000.0) as u64,
+                "expires_at": expires,
+            }));
+        }
     }
-    let entries = crate::registry::scan(&state.models_root);
-    let entry = entries.iter().find(|e| e.id == current);
-    let size = entry.map(|e| e.file_bytes).unwrap_or(0);
-    Json(json!({
-        "models": [{
-            "name": current,
-            "model": current,
-            "size": size,
-            "digest": "strata",
-            "details": { "format": "gguf", "family": entry.map(|e| e.arch.clone()).unwrap_or_default() },
-        }]
-    }))
+
+    for r in state.residents.lock().await.iter() {
+        let entry = entries.iter().find(|e| e.id == r.model);
+        models.push(json!({
+            "name": r.model,
+            "model": r.model,
+            "size": entry.map(|e| e.file_bytes).unwrap_or(0),
+            "digest": entry.map(|e| e.digest.clone()).unwrap_or_else(|| "strata-external".into()),
+            "details": entry
+                .map(crate::ollama::details)
+                .unwrap_or_else(|| json!({ "format": "gguf", "family": "unknown" })),
+            "expires_at": r.expires_at,
+        }));
+    }
+    Json(json!({ "models": models }))
 }
 
 /// POST /api/show - what a model file declares about itself.
@@ -2148,20 +3701,9 @@ async fn ollama_show(State(state): State<Shared>, Json(req): Json<Value>) -> Res
         )
             .into_response();
     };
-    Json(json!({
-        "details": {
-            "format": "gguf",
-            "family": e.arch,
-            "parameter_size": if e.is_moe { "MoE" } else { "dense" },
-        },
-        "model_info": {
-            "general.architecture": e.arch,
-            "strata.expert_count": e.experts,
-            "strata.expert_used": e.experts_used,
-            "strata.context_length": e.context,
-            "strata.file_bytes": e.file_bytes,
-        },
-        "capabilities": ["completion", "tools"],
-    }))
-    .into_response()
+    let verbose = req
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Json(crate::ollama::show_body_verbose(e, verbose)).into_response()
 }

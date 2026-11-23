@@ -3,6 +3,20 @@
 Notable changes to Strata. This project follows [semantic
 versioning](https://semver.org/): 0.x releases may break between minors.
 
+## [Unreleased] — Ollama parity
+
+- Full Ollama API and CLI compatibility: `/api/*`, `/v1/completions`,
+  `/v1/responses`, model management, registry pull/push, blobs, daemon,
+  doctor, update, config and global `strata` command.
+- Architecture-generic inference: dense, hybrid and MoE models share the
+  reader, tokenizer, registry and API; dense models get measured `-ngl`
+  offload instead of `-ngl 99`.
+- Own dequantizer (Q4_K/Q6_K) and byte-level BPE tokenizer, both verified
+  against llama.cpp on this machine.
+- Deterministic Ollama reverse-engineering dossier in `docs/OLLAMA-RE.md`.
+- Web console: model management and per-request think/format/keep-alive/image
+  controls.
+
 ## [0.1.0] — 2026-11-17
 
 First tagged release. Strata is a control plane around llama.cpp: it reads the

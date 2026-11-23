@@ -136,11 +136,24 @@ impl Placement {
             Some(n) if n > 0 => facts.layers / n,
             _ => facts.layers,
         };
-        let key_len = gguf.key_u64("attention.key_length").unwrap_or(0);
-        let value_len = gguf.key_u64("attention.value_length").unwrap_or(0);
+        // Newer GGUFs declare the K/V widths directly. Older ones (llama,
+        // gemma, mistral...) only declare the head count, so fall back to the
+        // head dimension: embedding / query heads, or rope.dimension_count.
+        let head_dim = gguf
+            .key_u64("attention.head_dim")
+            .or_else(|| gguf.key_u64("rope.dimension_count"))
+            .unwrap_or_else(|| {
+                if facts.heads > 0 {
+                    (facts.embedding / facts.heads) as u64
+                } else {
+                    0
+                }
+            });
+        let kv_heads = if facts.kv_heads > 0 { facts.kv_heads } else { facts.heads };
+        let key_len = gguf.key_u64("attention.key_length").unwrap_or(head_dim);
+        let value_len = gguf.key_u64("attention.value_length").unwrap_or(head_dim);
         // f16 cache: 2 bytes per element, K and V, per kv head, per layer.
-        let kv_bytes_per_token =
-            attention_layers as u64 * facts.kv_heads as u64 * (key_len + value_len) * 2;
+        let kv_bytes_per_token = attention_layers as u64 * kv_heads as u64 * (key_len + value_len) * 2;
         let kv_bytes = kv_bytes_per_token * ctx as u64;
 
         // Dense weights and the KV cache are what must be resident to run at
@@ -185,22 +198,32 @@ impl Placement {
         self.vram_experts as f32 / self.expert_count as f32
     }
 
-    /// Layers to offload, for a runtime that offloads whole layers.
+    /// How many whole layers fit in VRAM beside the KV cache.
+    ///
+    /// This is the dense-model equivalent of the expert split: a 14 GB dense
+    /// model on a 16 GB card keeps most layers on the GPU and lets llama.cpp
+    /// stream the rest from host memory. Returning 0 when the whole file does
+    /// not fit would be wrong — that is exactly when partial offload matters.
     pub fn gpu_layers(&self) -> usize {
-        let resident = self.dense_bytes + self.kv_bytes;
-        if resident >= self.vram_budget {
-            return 0;
-        }
-        let per_layer = self.total_weight_bytes / self.facts.layers.max(1) as u64;
-        if per_layer == 0 {
-            return 0;
-        }
-        (((self.vram_budget - self.kv_bytes) / per_layer) as usize).min(self.facts.layers)
+        gpu_layers_for(self.total_weight_bytes, self.kv_bytes, self.facts.layers, self.vram_budget)
     }
 
     pub fn fits_without_disk(&self) -> bool {
         self.disk_experts == 0
     }
+}
+
+/// Pure form of the dense-model offload decision, kept separate so it can be
+/// tested without opening a GGUF.
+pub fn gpu_layers_for(total_bytes: u64, kv_bytes: u64, layers: usize, vram: u64) -> usize {
+    if kv_bytes >= vram || layers == 0 {
+        return 0;
+    }
+    let per_layer = total_bytes / layers as u64;
+    if per_layer == 0 {
+        return 0;
+    }
+    (((vram - kv_bytes) / per_layer) as usize).min(layers)
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -249,16 +272,16 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
         "  dense         {:>8.2} GiB   (attention, norms, shared expert, embeddings)",
         gib(p.dense_bytes)
     );
-    println!(
-        "  routed        {:>8.2} GiB   ({} experts, {:.1} MiB each)",
-        gib(p.expert_bytes),
-        p.expert_count,
-        if p.expert_count > 0 {
+    if p.expert_count > 0 {
+        println!(
+            "  routed        {:>8.2} GiB   ({} experts, {:.1} MiB each)",
+            gib(p.expert_bytes),
+            p.expert_count,
             p.expert_bytes as f64 / p.expert_count as f64 / 1024.0 / 1024.0
-        } else {
-            0.0
-        }
-    );
+        );
+    } else {
+        println!("  routed        {:>8.2} GiB   (dense model — every layer is active)", gib(0));
+    }
     println!(
         "KV @ {:<7}    {:>8.2} GiB   ({} bytes/token)",
         ctx,
@@ -279,26 +302,34 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
     if p.dense_bytes + p.kv_bytes > p.vram_budget {
         println!("  does not fit in VRAM alone — dense weights must spill to RAM");
     }
+    if p.expert_count > 0 {
+        println!(
+            "experts in VRAM {:>8}  ({:.0}%)",
+            p.vram_experts,
+            100.0 * p.vram_fraction()
+        );
+        println!("experts in RAM  {:>8}", p.ram_experts);
+        println!(
+            "experts on disk {:>8}{}",
+            p.disk_experts,
+            if p.disk_experts > 0 {
+                "   <- streaming required"
+            } else {
+                ""
+            }
+        );
+    }
+    println!();
+    let gpu = p.gpu_layers();
     println!(
-        "experts in VRAM {:>8}  ({:.0}%)",
-        p.vram_experts,
-        100.0 * p.vram_fraction()
-    );
-    println!("experts in RAM  {:>8}", p.ram_experts);
-    println!(
-        "experts on disk {:>8}{}",
-        p.disk_experts,
-        if p.disk_experts > 0 {
-            "   <- streaming required"
+        "suggested --n-gpu-layers {} of {}{}",
+        gpu,
+        f.layers,
+        if p.expert_count == 0 {
+            "  (dense: whole-layer offload; the rest stream from host RAM)"
         } else {
             ""
         }
-    );
-    println!();
-    println!(
-        "suggested --n-gpu-layers {} of {}",
-        p.gpu_layers(),
-        f.layers
     );
     Ok(())
 }
@@ -346,6 +377,19 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn a_dense_model_gets_partial_gpu_offload_instead_of_all_or_nothing() {
+        // 14 GiB of weights, 1 GiB of KV, 16 GiB of VRAM: the old code returned
+        // 0 layers because the model did not fit whole. Ollama keeps what fits.
+        let n = gpu_layers_for(14 * GIB, 1 * GIB, 28, 16 * GIB);
+        assert_eq!(n, 28);
+        let n = gpu_layers_for(20 * GIB, 1 * GIB, 28, 16 * GIB);
+        assert!(n > 0 && n < 28, "got {n}");
+        assert_eq!(n, 21);
+        // A cache that alone fills VRAM leaves nothing for weights.
+        assert_eq!(gpu_layers_for(20 * GIB, 16 * GIB, 28, 16 * GIB), 0);
+    }
 
     /// Ornith-1.5-35B on the development machine: 20.21 GiB total, 1.56 GiB of
     /// it dense, 10,496 routed experts, 1.25 GiB of cache at ctx 65536.

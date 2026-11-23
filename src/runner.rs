@@ -137,6 +137,10 @@ pub struct Flags {
     /// not zero: leaving some experts in host memory frees VRAM for the layers
     /// that remain, and measures faster than forcing everything onto the GPU.
     pub cpu_moe_layers: usize,
+    /// `-ngl`: layers kept on the GPU. For MoE this stays at 99 — the expert
+    /// split below decides what is resident. For dense models it is the whole
+    /// placement decision, solved from measured bytes by `Placement::gpu_layers`.
+    pub gpu_layers: usize,
     pub flash_attention: bool,
     pub threads: usize,
     /// A non-prefix expert placement, rendered as an `-ot` pattern.
@@ -161,6 +165,15 @@ pub struct Flags {
     pub devices: Option<String>,
     /// Tensor split across devices, e.g. "3,1".
     pub tensor_split: Option<String>,
+    /// A Modelfile TEMPLATE, passed to llama.cpp as `--chat-template`. Without
+    /// this a derived model's template was stored and shown but never used.
+    pub chat_template: Option<String>,
+    /// A Modelfile ADAPTER, passed as `--lora`.
+    pub lora_adapter: Option<std::path::PathBuf>,
+    /// Serve embeddings from this process (`--embeddings`).
+    pub embeddings: bool,
+    pub batch: Option<usize>,
+    pub ubatch: Option<usize>,
 }
 
 impl Flags {
@@ -182,6 +195,7 @@ impl Flags {
         Self {
             ctx: p.ctx,
             cpu_moe_layers: layers.saturating_sub(gpu_expert_layers.min(layers)),
+            gpu_layers: if p.expert_count > 0 { 99 } else { p.gpu_layers() },
             flash_attention: true,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get() / 2)
@@ -194,6 +208,11 @@ impl Flags {
             mmproj: None,
             devices: None,
             tensor_split: None,
+            chat_template: None,
+            lora_adapter: None,
+            embeddings: false,
+            batch: None,
+            ubatch: None,
         }
     }
 
@@ -208,7 +227,7 @@ impl Flags {
             "-c".into(),
             self.ctx.to_string(),
             "-ngl".into(),
-            "99".into(),
+            self.gpu_layers.to_string(),
             "-t".into(),
             self.threads.to_string(),
             "--no-webui".into(),
@@ -275,6 +294,25 @@ impl Flags {
         if let Some(t) = &self.tensor_split {
             args.push("--tensor-split".into());
             args.push(t.clone());
+        }
+        if let Some(t) = &self.chat_template {
+            args.push("--chat-template".into());
+            args.push(t.clone());
+        }
+        if let Some(a) = &self.lora_adapter {
+            args.push("--lora".into());
+            args.push(a.to_string_lossy().into_owned());
+        }
+        if self.embeddings {
+            args.push("--embeddings".into());
+        }
+        if let Some(b) = self.batch {
+            args.push("-b".into());
+            args.push(b.to_string());
+        }
+        if let Some(b) = self.ubatch {
+            args.push("-ub".into());
+            args.push(b.to_string());
         }
         args
     }
@@ -476,6 +514,7 @@ mod tests {
         Flags {
             ctx: 65536,
             cpu_moe_layers: 15,
+            gpu_layers: 99,
             flash_attention: true,
             threads: 6,
             expert_override: None,
@@ -485,7 +524,21 @@ mod tests {
             mmproj: None,
             devices: None,
             tensor_split: None,
+            chat_template: None,
+            lora_adapter: None,
+            embeddings: false,
+            batch: None,
+            ubatch: None,
         }
+    }
+
+    #[test]
+    fn a_modelfile_template_reaches_the_compute_process() {
+        let mut f = base();
+        f.chat_template = Some("{{ .Prompt }}".into());
+        let args = f.to_args(Path::new("model.gguf"), 8099);
+        let i = args.iter().position(|a| a == "--chat-template").unwrap();
+        assert_eq!(args[i + 1], "{{ .Prompt }}");
     }
 
     /// The exact command line the tuned configuration on the development

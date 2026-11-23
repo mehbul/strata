@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import { readHealth, readModels, send, type Health, type RunResult, type Turn } from "./api"
+import { readHealth, readModels, send, switchModel, type Health, type RunResult, type Turn } from "./api"
 import { Inspector } from "./components/Inspector"
 import { ArrowUp, Chevron, Mark, PanelLeft, PanelRight, Plus, Stop } from "./components/icons"
 import { Sidebar } from "./components/Sidebar"
@@ -51,6 +51,11 @@ export default function App() {
   const [showInspector, setShowInspector] = useState(
     () => typeof window === "undefined" || window.innerWidth > 860,
   )
+  const [think, setThink] = useState(false)
+  const [format, setFormat] = useState("")
+  const [keepAlive, setKeepAlive] = useState("")
+  const [image, setImage] = useState<string | undefined>()
+  const [reasoningEffort, setReasoningEffort] = useState("")
   const abort = useRef<AbortController | null>(null)
   const field = useRef<HTMLTextAreaElement>(null)
   const foot = useRef<HTMLDivElement>(null)
@@ -134,6 +139,7 @@ export default function App() {
 
     setTurns([...history, answer])
     setDraft("")
+    setImage(undefined)
     setError("")
     setBusy(true)
     setRate(null)
@@ -153,7 +159,11 @@ export default function App() {
         system,
         temperature: 0.7,
         maxTokens: 4096,
-        reasoning: false,
+        reasoning: think,
+        format: format || undefined,
+        keepAlive: keepAlive || undefined,
+        reasoningEffort: reasoningEffort || undefined,
+        image,
         signal: controller.signal,
         onText: (chunk) => patch((t) => ({ ...t, text: t.text + chunk })),
         onThinking: (chunk) => patch((t) => ({ ...t, thinking: (t.thinking ?? "") + chunk })),
@@ -170,7 +180,7 @@ export default function App() {
       setBusy(false)
       abort.current = null
     }
-  }, [draft, busy, turns, model, system])
+  }, [draft, busy, turns, model, system, think, format, keepAlive, reasoningEffort, image])
 
   const startNew = () => {
     abort.current?.abort()
@@ -219,7 +229,14 @@ export default function App() {
         <select
           className="model-pick"
           value={model}
-          onChange={(e) => setModel(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value
+            setModel(next)
+            // The compute process serves one set of weights, so picking a name
+            // has to load it. Without this the picker only relabelled the next
+            // turn and the model never changed.
+            switchModel(next).catch((err) => setError(String(err)))
+          }}
           aria-label="Model"
         >
           {models.length ? models.map((id) => <option key={id}>{id}</option>) : <option>{model || "—"}</option>}
@@ -318,6 +335,57 @@ export default function App() {
                 {error}
               </div>
             ) : null}
+            <div className="composer-options">
+              <label title="Attach an image for vision models">
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0]
+                    if (!file) { setImage(undefined); return }
+                    const reader = new FileReader()
+                    reader.onload = () => setImage(String(reader.result))
+                    reader.readAsDataURL(file)
+                  }}
+                />
+              </label>
+              <label title="Let the model reason before answering">
+                <input type="checkbox" checked={think} onChange={(e) => setThink(e.target.checked)} />
+                Think
+              </label>
+              <select
+                aria-label="Reasoning effort"
+                value={reasoningEffort}
+                onChange={(e) => setReasoningEffort(e.target.value)}
+                title="Reasoning effort"
+              >
+                <option value="">effort: default</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="xhigh">xhigh</option>
+              </select>
+              <select
+                aria-label="Response format"
+                value={format}
+                onChange={(e) => setFormat(e.target.value)}
+                title="Response format"
+              >
+                <option value="">text</option>
+                <option value="json">JSON</option>
+              </select>
+              <select
+                aria-label="Keep alive"
+                value={keepAlive}
+                onChange={(e) => setKeepAlive(e.target.value)}
+                title="How long the model stays resident"
+              >
+                <option value="">keep: default</option>
+                <option value="5m">5m</option>
+                <option value="30m">30m</option>
+                <option value="-1">forever</option>
+                <option value="0">unload after</option>
+              </select>
+            </div>
             <div className="composer">
               <textarea
                 ref={field}

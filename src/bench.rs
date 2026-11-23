@@ -27,6 +27,9 @@ pub struct BenchArgs {
     /// Write results as JSON to this path
     #[arg(long)]
     pub json: Option<String>,
+    /// Compare the new run with a previous JSON result
+    #[arg(long)]
+    pub compare: Option<String>,
 }
 
 pub async fn run(args: BenchArgs) -> Result<()> {
@@ -185,6 +188,23 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         });
         std::fs::write(path, serde_json::to_string_pretty(&json_out)?)?;
         println!("  wrote {}", path);
+    }
+
+    if let Some(path) = &args.compare {
+        let old: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let get = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+        println!("Comparison with {path}:");
+        for key in ["ttft_ms", "prefill_tps", "decode_tps", "total_ms"] {
+            let before = get(&old, key);
+            let now = match key {
+                "ttft_ms" => ttft as f64,
+                "prefill_tps" => prefill_tps,
+                "decode_tps" => decode_tps,
+                _ => total_ms as f64,
+            };
+            let delta = if before > 0.0 { (now - before) / before * 100.0 } else { 0.0 };
+            println!("  {:<14} {:.1} -> {:.1} ({:+.1}%)", key, before, now, delta);
+        }
     }
 
     Ok(())

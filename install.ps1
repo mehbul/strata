@@ -107,11 +107,40 @@ if ($models.Count -eq 0) {
 .\target\release\strata.exe setup
 if ($LASTEXITCODE -ne 0) { Fail "setup failed" }
 
+# --- global command ---------------------------------------------------------
+# The engine discovers `runtime\` and `rocm\models\` relative to the working
+# directory, so a bare PATH entry to target\release would silently lose the GPU
+# runtime. A small shim changes directory first.
+Step "Installing the 'strata' command"
+$binDir = Join-Path $env:USERPROFILE ".strata\bin"
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+$exePath = (Resolve-Path "target\release\strata.exe").Path
+$projectDir = (Get-Location).Path
+Set-Content -Path (Join-Path $binDir "strata.cmd") -Encoding ASCII -Value @(
+    "@echo off"
+    "cd /d `"$projectDir`""
+    'if not exist "target\release\strata.exe" cargo build --release'
+    'if errorlevel 1 exit /b 1'
+    'for /f %%i in (''powershell -NoProfile -Command "(Get-ChildItem src -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime -gt (Get-Item target\release\strata.exe).LastWriteTime"'') do if "%%i"=="True" cargo build --release'
+    'if errorlevel 1 exit /b 1'
+    "`"$exePath`" %*"
+)
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$binDir*") {
+    $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $binDir } else { "$userPath;$binDir" }
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    $env:Path = "$env:Path;$binDir"
+}
+Say "strata.cmd in $binDir (open a new terminal to pick up PATH)"
+
 Write-Host @"
 
   Ready. Start it with:
 
-    cd strata
+    strata serve --model <name>
+
+  or, from this directory:
+
     .\strata.ps1
 
   Then open http://localhost:8080

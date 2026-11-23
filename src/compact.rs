@@ -145,6 +145,9 @@ pub struct Compactor {
     /// whole history every turn, so after the first turn only the new messages
     /// reach the tokenizer.
     counts: Mutex<HashMap<u64, usize>>,
+    /// Strata's own BPE, when a local GGUF is available. Using it keeps
+    /// compaction working even with no reachable /tokenize endpoint.
+    local: Option<crate::tokenizer::Tokenizer>,
     pub stats: Stats,
 }
 
@@ -157,8 +160,18 @@ impl Compactor {
             enabled,
             summaries: Mutex::new(HashMap::new()),
             counts: Mutex::new(HashMap::new()),
+            local: None,
             stats: Stats::default(),
         }
+    }
+
+    /// Prefer Strata's tokenizer over the runtime's `/tokenize`. A bad path
+    /// leaves the upstream path in place rather than breaking compaction.
+    pub fn with_tokenizer(mut self, model_path: Option<&std::path::Path>) -> Self {
+        self.local = model_path.and_then(|p| {
+            crate::tokenizer::Tokenizer::from_gguf(&p.to_string_lossy()).ok()
+        });
+        self
     }
 
     /// Tokens available to the conversation once the reply is accounted for.
@@ -414,6 +427,11 @@ impl Compactor {
     /// reached. The estimate is deliberately high: undercounting overflows the
     /// context, overcounting only compacts a little sooner than needed.
     async fn tokenize(&self, text: &str) -> usize {
+        if let Some(tok) = &self.local {
+            if let Ok(ids) = tok.encode(text) {
+                return ids.len();
+            }
+        }
         let sent = self
             .client
             .post(format!("{}/tokenize", self.upstream))

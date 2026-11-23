@@ -1037,6 +1037,37 @@ button {
   background: var(--bg-elev);
   color: var(--fg);
 }
+/* Composer request options. */
+.composer-options {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 2px 2px 6px; font-size: 0.78rem; color: var(--muted, #888);
+}
+.composer-options label { display: inline-flex; align-items: center; gap: 4px; }
+.composer-options select {
+  border: 1px solid var(--line, #333); border-radius: 6px;
+  background: var(--panel, #111); color: inherit; padding: 3px 6px;
+}
+
+/* Model-management pane (inspector → Models). */
+.stack { display: flex; flex-direction: column; gap: 8px; }
+.stack h3 { margin: 14px 0 2px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted, #888); }
+.stack input, .stack textarea {
+  width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--line, #333); background: var(--panel, #111); color: inherit;
+}
+.stack textarea { resize: vertical; font-family: ui-monospace, monospace; }
+.btn {
+  border: 1px solid var(--line, #333); border-radius: 6px; padding: 5px 10px;
+  background: var(--panel, #111); color: inherit; cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: var(--hover, #222); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.model-list { display: flex; flex-direction: column; gap: 4px; }
+.model-row { display: flex; justify-content: space-between; gap: 8px; font-size: 0.82rem; }
+.muted { color: var(--muted, #888); font-size: 0.78rem; }
+.link { background: none; border: 0; padding: 0; color: var(--accent, #7ab); cursor: pointer; text-align: left; }
+.code-block { white-space: pre-wrap; word-break: break-word; font-size: 0.74rem; opacity: 0.85; }
+
 /* Loading takes ~7s and unloading waits for in-flight turns, so the button
    must show it is working rather than looking dead. */
 .model-action:disabled {

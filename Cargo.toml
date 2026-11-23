@@ -17,13 +17,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 memmap2 = "0.9"
 safetensors = "0.4"
 axum = { version = "0.7", features = ["json", "ws"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 libloading = "0.8"
 bytemuck = "1"
 futures = "0.3.34"
 async-stream = "0.3"
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
 
 [features]
 default = []

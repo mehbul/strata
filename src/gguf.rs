@@ -391,6 +391,14 @@ pub struct ModelFacts {
     pub full_attention_interval: Option<usize>,
     pub file_bytes: u64,
     pub tensor_count: usize,
+    /// Sum of every tensor's element count. A derived estimate of stored
+    /// parameters: experts are counted once each, and tied embeddings count
+    /// twice, exactly as they are stored in the file.
+    pub parameter_count: u64,
+    /// Derived from the tensor type distribution, not from `general.file_type`:
+    /// a file declaring file_type 15 can still hold Q4_K + Q6_K tensors, which
+    /// is what actually makes it a Q4_K_M.
+    pub quantization_level: String,
 }
 
 impl ModelFacts {
@@ -418,6 +426,8 @@ impl ModelFacts {
             full_attention_interval: gguf.key_u64("full_attention_interval").map(|v| v as usize),
             file_bytes: gguf.file_size,
             tensor_count: gguf.tensors.len(),
+            parameter_count: gguf.tensors.iter().map(|t| t.elements()).sum(),
+            quantization_level: quantization_level(gguf),
         })
     }
 
@@ -427,6 +437,117 @@ impl ModelFacts {
 
     pub fn is_hybrid_ssm(&self) -> bool {
         self.ssm_state.is_some()
+    }
+}
+
+/// Report the quantisation the weights are actually stored in.
+///
+/// K-quant "size" suffixes are decided by which tensors are *not* in the
+/// dominant quant: Q4_K plus Q6_K is Q4_K_M, Q4_K alone is Q4_K_S, and Q3_K
+/// plus Q6_K is Q3_K_L. This mirrors what a model card means and avoids
+/// trusting `general.file_type`, which is often stale on converted models.
+pub fn quantization_level(gguf: &Gguf) -> String {
+    // Ollama reports `general.file_type` through its own ggml.FileType table,
+    // which is the same iota order as llama_ftype. Use it first: it names
+    // quantisations whose tensor ids this reader does not decode (IQ*, TQ*),
+    // and it is what the Ollama client will compare against.
+    if let Some(ft) = gguf
+        .metadata
+        .get("general.file_type")
+        .and_then(|v| v.as_u64())
+    {
+        if let Some(label) = file_type_label(ft) {
+            return label.into();
+        }
+    }
+    let by_type = gguf.by_type();
+    let Some((dominant, _, _)) = by_type.first() else {
+        return "unknown".into();
+    };
+    let has = |name: &str| by_type.iter().any(|(n, _, _)| n == name);
+    let base = dominant.as_str();
+    match base {
+        "Q2_K" if has("Q6_K") => "Q2_K_L".into(),
+        "Q3_K" if has("Q6_K") => "Q3_K_L".into(),
+        "Q4_K" if has("Q6_K") => "Q4_K_M".into(),
+        "Q5_K" if has("Q6_K") => "Q5_K_M".into(),
+        "Q6_K" if has("F16") => "Q6_K".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Ollama's `ggml.FileType` numbering (fs/ggml/type.go), which is the numeric
+/// `general.file_type` written into a GGUF header.
+pub fn file_type_label(ft: u64) -> Option<&'static str> {
+    Some(match ft {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        4 => "Q4_1_F16",
+        5 => "Q4_2",
+        6 => "Q4_3",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        33 => "TQ1_0",
+        34 => "TQ2_0",
+        35 => "MXFP4_MOE",
+        36 => "NVFP4",
+        37 => "Q1_0",
+        _ => return None,
+    })
+}
+
+impl Gguf {
+    /// Scalar header declarations, in Ollama's `model_info` shape. Arrays of
+    /// tokens and merges are deliberately left out: they are large and clients
+    /// only ask for them with an explicit verbose flag.
+    pub fn metadata_info(&self) -> Vec<(String, String)> {
+        self.metadata
+            .iter()
+            .filter_map(|(k, v)| {
+                let s = match v {
+                    Value::Str(s) => s.clone(),
+                    Value::U8(n) => n.to_string(),
+                    Value::I8(n) => n.to_string(),
+                    Value::U16(n) => n.to_string(),
+                    Value::I16(n) => n.to_string(),
+                    Value::U32(n) => n.to_string(),
+                    Value::I32(n) => n.to_string(),
+                    Value::U64(n) => n.to_string(),
+                    Value::I64(n) => n.to_string(),
+                    Value::F32(n) => n.to_string(),
+                    Value::F64(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return None,
+                };
+                Some((k.clone(), s))
+            })
+            .collect()
     }
 }
 
@@ -446,6 +567,14 @@ pub fn inspect(path: &str) -> Result<()> {
     );
     println!();
     println!("layers        : {}", facts.layers);
+    println!(
+        "parameters    : {} (sum of tensor elements; derived)",
+        facts.parameter_count
+    );
+    println!(
+        "quantisation  : {} (GGUF file type, else tensor types)",
+        facts.quantization_level
+    );
     println!("embedding     : {}", facts.embedding);
     println!(
         "attn heads    : {} query / {} kv",
@@ -492,4 +621,34 @@ pub fn inspect(path: &str) -> Result<()> {
         println!("  {:<34} {:<20} {}", t.name, dims, t.kind.name());
     }
     Ok(())
+}
+
+/// Print every layer's tensors, not just layer 0.
+pub fn inspect_all(path: &str) -> Result<()> {
+    let g = Gguf::open(path)?;
+    let facts = ModelFacts::read(&g)?;
+    println!("=== {} — {} layers ===", facts.name, facts.layers);
+    for layer in 0..facts.layers {
+        let tensors = g.layer_tensors(layer);
+        if tensors.is_empty() { continue }
+        println!("\n--- layer {layer} ({} tensors) ---", tensors.len());
+        for t in tensors {
+            let dims = t.dims.iter().map(u64::to_string).collect::<Vec<_>>().join(" x ");
+            println!("  {:<40} {:<20} {}", t.name, dims, t.kind.name());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_types_match_ollamas_table() {
+        assert_eq!(file_type_label(15), Some("Q4_K_M"));
+        assert_eq!(file_type_label(27), Some("IQ3_M"));
+        assert_eq!(file_type_label(7), Some("Q8_0"));
+        assert_eq!(file_type_label(9999), None);
+    }
 }

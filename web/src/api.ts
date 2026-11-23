@@ -223,6 +223,23 @@ export async function setModelLoaded(loaded: boolean): Promise<void> {
   if (!response.ok) throw new Error(await failure(response))
 }
 
+/**
+ * Load a different model in place of the one that is resident.
+ *
+ * Selecting a name in the picker is a request to run that model, not just to
+ * label the next turn with it: the compute process is serving exactly one set
+ * of weights, so the choice has to reach the server. The server rolls back to
+ * the previous model if the new one fails to load.
+ */
+export async function switchModel(model: string): Promise<void> {
+  const response = await fetch(api("/api/models/load"), {
+    method: "POST",
+    headers: { ...auth(), "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  })
+  if (!response.ok) throw new Error(await failure(response))
+}
+
 export interface SendOptions {
   model: string
   history: Turn[]
@@ -231,6 +248,14 @@ export interface SendOptions {
   temperature: number
   maxTokens: number
   reasoning: boolean
+  /** "json" or a JSON schema; sent as OpenAI response_format. */
+  format?: string
+  /** Ollama keep_alive duration, e.g. "5m" or "0". */
+  keepAlive?: string
+  /** low / medium / xhigh for reasoning-capable templates. */
+  reasoningEffort?: string
+  /** data:image/...;base64 URL for vision models. */
+  image?: string
   signal: AbortSignal
   onText: (chunk: string) => void
   onThinking: (chunk: string) => void
@@ -247,13 +272,30 @@ export async function send(options: SendOptions): Promise<RunResult> {
     signal: options.signal,
     body: JSON.stringify({
       model: options.model,
-      messages: [
-        ...(options.system?.trim() ? [{ role: "system", content: options.system.trim() }] : []),
-        ...options.history.map(({ role, text }) => ({ role, content: text })),
-      ],
+      messages: (() => {
+        const messages: any[] = [
+          ...(options.system?.trim() ? [{ role: "system", content: options.system.trim() }] : []),
+          ...options.history.map(({ role, text }) => ({ role, content: text })),
+        ]
+        if (options.image) {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === "user") {
+              messages[i].content = [
+                { type: "text", text: messages[i].content },
+                { type: "image_url", image_url: { url: options.image } },
+              ]
+              break
+            }
+          }
+        }
+        return messages
+      })(),
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.reasoning,
+      ...(options.format ? { response_format: options.format === "json" ? { type: "json_object" } : JSON.parse(options.format) } : {}),
+      ...(options.keepAlive ? { keep_alive: options.keepAlive } : {}),
+      ...(options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }),
@@ -301,4 +343,86 @@ export async function send(options: SendOptions): Promise<RunResult> {
     stopReason,
     queueWaitMs: Number.isFinite(waited) ? waited : null,
   }
+}
+
+// ---------------------------------------------------------------- model management
+
+export interface InstalledModel {
+  name: string
+  model: string
+  modified_at: string
+  size: number
+  digest: string
+  details: Record<string, unknown>
+}
+
+export interface RunningModel extends InstalledModel {
+  expires_at?: string | null
+}
+
+export interface ShowResponse {
+  modelfile?: string
+  template?: string
+  system?: string | null
+  parameters?: string
+  details?: Record<string, unknown>
+  model_info?: Record<string, unknown>
+  capabilities?: string[]
+}
+
+async function jsonRequest(path: string, init: RequestInit): Promise<any> {
+  const response = await fetch(api(path), {
+    ...init,
+    headers: { ...auth(), "Content-Type": "application/json", ...(init.headers || {}) },
+  })
+  if (!response.ok) throw new Error(await failure(response))
+  return response.json()
+}
+
+export async function listInstalled(): Promise<InstalledModel[]> {
+  const body = await jsonRequest("/api/tags", { method: "GET" })
+  return body.models ?? []
+}
+
+export async function listRunning(): Promise<RunningModel[]> {
+  const body = await jsonRequest("/api/ps", { method: "GET" })
+  return body.models ?? []
+}
+
+export async function showModel(model: string, verbose = false): Promise<ShowResponse> {
+  return jsonRequest("/api/show", { method: "POST", body: JSON.stringify({ model, verbose }) })
+}
+
+export async function copyModel(source: string, destination: string): Promise<void> {
+  await jsonRequest("/api/copy", { method: "POST", body: JSON.stringify({ source, destination }) })
+}
+
+export async function deleteModel(model: string): Promise<void> {
+  await jsonRequest("/api/delete", { method: "DELETE", body: JSON.stringify({ model }) })
+}
+
+export async function pullModel(model: string): Promise<string> {
+  const response = await fetch(api("/api/pull"), {
+    method: "POST",
+    headers: { ...auth(), "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  })
+  if (!response.ok) throw new Error(await failure(response))
+  return response.text()
+}
+
+export async function pushModel(model: string): Promise<void> {
+  await jsonRequest("/api/push", { method: "POST", body: JSON.stringify({ model }) })
+}
+
+export async function createModel(name: string, body: Record<string, unknown>): Promise<void> {
+  await jsonRequest("/api/create", { method: "POST", body: JSON.stringify({ model: name, ...body }) })
+}
+
+export async function embed(model: string, input: string[]): Promise<number[][]> {
+  const body = await jsonRequest("/api/embed", {
+    method: "POST",
+    body: JSON.stringify({ model, input }),
+  })
+  return body.embeddings ?? []
 }

@@ -7,18 +7,36 @@
 //! where `plan`, `tune` and `serve` look for it.
 
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub struct Hub {
     /// Where models are kept. `rocm/models`, matching `placement::find`.
     pub cache_dir: PathBuf,
+    /// Optional sink for progress lines, used by `/api/pull` to stream NDJSON
+    /// while the CLI keeps printing to stdout.
+    progress: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl Hub {
     pub fn new() -> Self {
         Self {
             cache_dir: PathBuf::from("rocm/models"),
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(sink: impl Fn(String) + Send + Sync + 'static) -> Self {
+        Self {
+            cache_dir: PathBuf::from("rocm/models"),
+            progress: Some(std::sync::Arc::new(sink)),
+        }
+    }
+
+    fn say(&self, message: String) {
+        println!("{message}");
+        if let Some(sink) = &self.progress {
+            sink(message);
         }
     }
 
@@ -30,6 +48,8 @@ impl Hub {
     /// rather than a guess: inventing an owner for it only turns a typo into a
     /// 404 from a repository the caller never named.
     pub async fn pull(&self, model: &str) -> Result<PathBuf> {
+        let force_registry = model.starts_with("ollama:");
+        let model = model.strip_prefix("ollama:").unwrap_or(model);
         let out = self.cache_dir.join(Self::dir_name(model));
         let dest = out.join("model.gguf");
 
@@ -37,32 +57,33 @@ impl Hub {
         //    decided by reading the header, not by file size: that is true of a
         //    500 MB model and false of a truncated 30 GB download.
         if is_gguf(&dest) {
-            println!(
+            self.say(format!(
                 "hub: {model} is already at {} ({:.1} GB)",
                 dest.display(),
                 file_gb(&dest)
-            );
+            ));
             return Ok(out);
         }
 
         // 2. A blob Ollama has already downloaded, found through its manifests.
         if let Some(blob) = ollama_blob(model) {
             std::fs::create_dir_all(&out)?;
-            println!("hub: Ollama has {model} ({:.1} GB)", file_gb(&blob));
-            println!("     {} -> {}", blob.display(), dest.display());
+            self.say(format!("hub: Ollama has {model} ({:.1} GB)", file_gb(&blob)));
+            self.say(format!("     {} -> {}", blob.display(), dest.display()));
             std::fs::copy(&blob, &dest)
                 .with_context(|| format!("copying {} to {}", blob.display(), dest.display()))?;
             return Ok(out);
         }
 
-        // 3. Hugging Face, for a repository named in full.
+        // 3. Ollama's own registry for a plain model name (or an explicit
+        //    `ollama:` prefix for a namespaced one).
+        if force_registry || hf_ref(model).is_none() {
+            return self.pull_from_registry(model, &out).await;
+        }
+
+        // 4. Hugging Face, for a repository named in full.
         let Some((repo, wanted)) = hf_ref(model) else {
-            bail!(
-                "nothing called {model} to pull.\n  \
-                 Ollama does not have it, and it does not name a Hugging Face\n  \
-                 repository. Pass one as owner/repo, or put a .gguf at\n  {}",
-                dest.display()
-            )
+            bail!("nothing called {model} to pull")
         };
 
         let client = reqwest::Client::new();
@@ -89,10 +110,10 @@ impl Hub {
         };
 
         std::fs::create_dir_all(&out)?;
-        println!(
+        self.say(format!(
             "hub: pulling https://huggingface.co/{repo} -> {}",
             dest.display()
-        );
+        ));
         self.download(&client, repo, &file, &dest).await?;
         if !is_gguf(&dest) {
             bail!(
@@ -100,11 +121,11 @@ impl Hub {
                 dest.display()
             );
         }
-        println!(
+        self.say(format!(
             "hub: {model} ready at {} ({:.1} GB)",
             dest.display(),
             file_gb(&dest)
-        );
+        ));
         Ok(out)
     }
 
@@ -116,7 +137,7 @@ impl Hub {
     /// which nobody is going to type. A named file supplies the name, since two
     /// quants of one repository must not land in the same directory; otherwise
     /// the repository's own last segment does.
-    fn dir_name(model: &str) -> String {
+    pub fn dir_name(model: &str) -> String {
         let name = match hf_ref(model) {
             Some((_, Some(file))) => {
                 let base = file.rsplit('/').next().unwrap_or(file);
@@ -139,6 +160,179 @@ impl Hub {
         kept.replace(':', "_").replace('/', "_").replace("..", "_")
     }
 
+    /// Pull a model straight from Ollama's public registry. No Ollama install
+    /// is needed: the manifest names content-addressed layers, and those blobs
+    /// are downloadable anonymously for public models.
+    async fn pull_from_registry(&self, model: &str, out: &std::path::Path) -> Result<PathBuf> {
+        let (name, tag) = match model.split_once(':') {
+            Some((n, t)) => (n, t),
+            None => (model, "latest"),
+        };
+        let repo = if name.contains('/') {
+            name.to_string()
+        } else {
+            format!("library/{name}")
+        };
+        let base = std::env::var("OLLAMA_REGISTRY")
+            .unwrap_or_else(|_| "https://registry.ollama.ai".into());
+        let base = base.trim_end_matches('/').to_string();
+        let client = reqwest::Client::new();
+        self.say(format!("hub: pulling manifest for {repo}:{tag}"));
+
+        let manifest_url = format!("{base}/v2/{repo}/manifests/{tag}");
+        let mut request = client
+            .get(&manifest_url)
+            .header("Accept", "application/vnd.docker.distribution.manifest.v2+json");
+        if let Some(token) = crate::auth::token() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send()
+            .await
+            .with_context(|| format!("GET {manifest_url}"))?;
+        if !resp.status().is_success() {
+            bail!("registry returned {} for {repo}:{tag}", resp.status());
+        }
+        let manifest: Value = resp.json().await?;
+        let layers = manifest
+            .get("layers")
+            .and_then(Value::as_array)
+            .context("registry manifest has no layers")?;
+
+        let blob_dir = crate::blob::blob_dir(&self.cache_dir);
+        std::fs::create_dir_all(&blob_dir)?;
+        std::fs::create_dir_all(out)?;
+        let mut weights: Option<PathBuf> = None;
+        let mut projector: Option<PathBuf> = None;
+        let mut system = String::new();
+        let mut template = String::new();
+        let mut renderer = String::new();
+        let mut parser = String::new();
+        let mut license = String::new();
+        let mut parameters = serde_json::Map::new();
+        let mut total: u64 = 0;
+        let wanted: u64 = layers.iter().filter_map(|l| l.get("size").and_then(Value::as_u64)).sum();
+
+        for layer in layers {
+            let media = layer.get("mediaType").and_then(Value::as_str).unwrap_or("");
+            let digest = layer
+                .get("digest")
+                .and_then(Value::as_str)
+                .context("registry layer has no digest")?;
+            let size = layer.get("size").and_then(Value::as_u64).unwrap_or(0);
+            let blob = crate::blob::blob_path(&self.cache_dir, digest)?;
+            if !blob.exists() {
+                self.download_registry_blob(&client, &base, &repo, digest, size, &blob)
+                    .await?;
+            }
+            total += size;
+            self.say(format!("hub: layer {digest} ({:.1} GB)", size as f32 / 1e9));
+            match media {
+                "application/vnd.ollama.image.model" => weights = Some(blob),
+                "application/vnd.ollama.image.projector" => projector = Some(blob),
+                "application/vnd.ollama.image.system" => {
+                    system = std::fs::read_to_string(&blob).unwrap_or_default()
+                }
+                "application/vnd.ollama.image.template" => {
+                    template = std::fs::read_to_string(&blob).unwrap_or_default()
+                }
+                "application/vnd.ollama.image.renderer" => {
+                    renderer = std::fs::read_to_string(&blob).unwrap_or_default()
+                }
+                "application/vnd.ollama.image.parser" => {
+                    parser = std::fs::read_to_string(&blob).unwrap_or_default()
+                }
+                "application/vnd.ollama.image.license" => {
+                    license = std::fs::read_to_string(&blob).unwrap_or_default()
+                }
+                "application/vnd.ollama.image.parameters" => {
+                    let text = std::fs::read_to_string(&blob).unwrap_or_default();
+                    for line in text.lines() {
+                        let mut parts = line.splitn(2, char::is_whitespace);
+                        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                            parameters.insert(k.into(), Value::String(v.trim().into()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let src = weights.context("registry manifest has no model layer")?;
+        let dest = out.join("model.gguf");
+        if std::fs::hard_link(&src, &dest).is_err() {
+            std::fs::copy(&src, &dest)?;
+        }
+        if let Some(p) = projector {
+            let to = out.join("mmproj.gguf");
+            let fallback = p.clone();
+            if std::fs::hard_link(p, &to).is_err() {
+                std::fs::copy(fallback, &to)?;
+            }
+        }
+        let mut overrides = serde_json::Map::new();
+        if !system.is_empty() { overrides.insert("system".into(), json!(system)); }
+        if !template.is_empty() { overrides.insert("template".into(), json!(template)); }
+        if !renderer.is_empty() { overrides.insert("renderer".into(), json!(renderer)); }
+        if !parser.is_empty() { overrides.insert("parser".into(), json!(parser)); }
+        if !license.is_empty() { overrides.insert("license".into(), json!(license)); }
+        if !parameters.is_empty() {
+            overrides.insert("parameters".into(), Value::Object(parameters));
+        }
+        if !overrides.is_empty() {
+            std::fs::write(
+                out.join("strata.json"),
+                serde_json::to_string_pretty(&Value::Object(overrides))?,
+            )?;
+        }
+        crate::registry::tag(&self.cache_dir, model, &Self::dir_name(model))?;
+        let _ = (total, wanted);
+        self.say(format!("hub: {model} ready at {} ({:.1} GB)", dest.display(), file_gb(&dest)));
+        Ok(out.to_path_buf())
+    }
+
+    async fn download_registry_blob(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        repo: &str,
+        digest: &str,
+        size: u64,
+        dest: &std::path::Path,
+    ) -> Result<()> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let url = format!("{base}/v2/{repo}/blobs/{digest}");
+        let partial = dest.with_extension("partial");
+        let mut request = client.get(&url);
+        if let Some(token) = crate::auth::token() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await.with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            bail!("blob download returned {}", resp.status());
+        }
+        let mut file = tokio::fs::File::create(&partial).await?;
+        let mut stream = resp.bytes_stream();
+        let mut done = 0u64;
+        let mut next_report = 500_000_000u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            done += chunk.len() as u64;
+            if done >= next_report {
+                self.say(format!("  {:.1} / {:.1} GB", done as f32 / 1e9, size as f32 / 1e9));
+                next_report = done + 500_000_000;
+            }
+        }
+        file.flush().await?;
+        drop(file);
+        let got = crate::blob::sha256_hex(std::fs::File::open(&partial)?)?;
+        let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
+        anyhow::ensure!(got == expected, "digest mismatch for {digest}: got sha256:{got}");
+        tokio::fs::rename(&partial, dest).await?;
+        Ok(())
+    }
+
     /// Stream one file down, resuming a partial one where the server allows it.
     ///
     /// A failure here returns an error. It used to write a few bytes of apology
@@ -157,7 +351,7 @@ impl Hub {
 
         let mut req = client.get(&url);
         if resume_from > 0 {
-            println!("  resuming at {:.1} GB", resume_from as f32 / 1e9);
+            self.say(format!("  resuming at {:.1} GB", resume_from as f32 / 1e9));
             req = req.header("Range", format!("bytes={resume_from}-"));
         }
         let res = req.send().await.with_context(|| format!("GET {url}"))?;
@@ -189,10 +383,10 @@ impl Hub {
             file.write_all(&c).await?;
             done += c.len() as u64;
             if done >= next_report {
-                match total {
-                    0 => println!("  {:.1} GB", done as f32 / 1e9),
-                    t => println!("  {:.1} / {:.1} GB", done as f32 / 1e9, t as f32 / 1e9),
-                }
+                self.say(match total {
+                    0 => format!("  {:.1} GB", done as f32 / 1e9),
+                    t => format!("  {:.1} / {:.1} GB", done as f32 / 1e9, t as f32 / 1e9),
+                });
                 next_report = done + 500_000_000;
             }
         }

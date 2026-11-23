@@ -6,15 +6,26 @@ import {
   apiKey,
   setApiKey,
   setModelLoaded,
+  copyModel,
+  createModel,
+  deleteModel,
+  embed,
+  listInstalled,
+  listRunning,
+  pullModel,
+  pushModel,
+  showModel,
   type Compaction,
   type Cortex,
   type Health,
+  type InstalledModel,
   type ModelState,
   type ProfileTurn,
+  type RunningModel,
 } from "../api"
 import { PRESETS } from "../store"
 
-type Pane = "session" | "experts" | "profiling" | "settings"
+type Pane = "session" | "models" | "experts" | "profiling" | "settings"
 
 /** Tier → colour. Green is resident on the GPU, grey is host RAM, dark is cold. */
 const TIER: Record<number, [number, number, number]> = {
@@ -50,7 +61,7 @@ export function Inspector({
   return (
     <aside className="inspector">
       <div className="inspector-tabs" role="tablist" aria-label="Inspector">
-        {(["session", "experts", "profiling", "settings"] as Pane[]).map((id) => (
+        {(["session", "models", "experts", "profiling", "settings"] as Pane[]).map((id) => (
           <button
             key={id}
             role="tab"
@@ -60,17 +71,21 @@ export function Inspector({
           >
             {id === "session"
               ? "Session"
-              : id === "experts"
-                ? "Experts"
-                : id === "profiling"
-                  ? "Profiling"
-                  : "Setup"}
+              : id === "models"
+                ? "Models"
+                : id === "experts"
+                  ? "Experts"
+                  : id === "profiling"
+                    ? "Profiling"
+                    : "Setup"}
           </button>
         ))}
       </div>
       <div className="inspector-body">
         {pane === "session" ? (
           <Session health={health} />
+        ) : pane === "models" ? (
+          <Models connected={connected} />
         ) : pane === "experts" ? (
           <Experts connected={connected} simulated={!!health?.simulated} />
         ) : pane === "profiling" ? (
@@ -90,6 +105,8 @@ function Session({ health }: { health: Health | null }) {
   const c = health?.compaction
   const m = health?.model
   const slots = s?.capacity ?? health?.kv_slots ?? 4
+  const residents = (health as any)?.additional_residents ?? 0
+  const residentCapacity = (health as any)?.resident_capacity ?? 1
   const lost = s ? s.rejected + s.timed_out + s.cancelled : 0
 
   if (!health) return <p className="empty-note">Not connected to the engine.</p>
@@ -106,6 +123,7 @@ function Session({ health }: { health: Health | null }) {
     <>
       <section className="group">
         <h3 className="group-title">Scheduler</h3>
+        <p className="muted">Resident models: {residents + (m?.owned ? 1 : 0)} / {residentCapacity}</p>
         <div className="slots">
           {Array.from({ length: slots }, (_, i) => {
             const busy = i < (s?.active ?? 0)
@@ -636,6 +654,121 @@ function Profiling({ connected }: { connected: boolean }) {
         </dl>
       </section>
     </>
+  )
+}
+
+function Models({ connected }: { connected: boolean }) {
+  const [models, setModels] = useState<InstalledModel[]>([])
+  const [running, setRunning] = useState<RunningModel[]>([])
+  const [selected, setSelected] = useState("")
+  const [source, setSource] = useState("")
+  const [destination, setDestination] = useState("")
+  const [pull, setPull] = useState("")
+  const [createName, setCreateName] = useState("")
+  const [modelfile, setModelfile] = useState("FROM ")
+  const [embedText, setEmbedText] = useState("")
+  const [message, setMessage] = useState("")
+  const [busy, setBusy] = useState(false)
+
+  const refresh = async () => {
+    if (!connected) return
+    try {
+      const [all, active] = await Promise.all([listInstalled(), listRunning()])
+      setModels(all)
+      setRunning(active)
+    } catch (e) {
+      setMessage(String(e))
+    }
+  }
+  useEffect(() => { void refresh() }, [connected])
+
+  const act = async (label: string, fn: () => Promise<unknown>) => {
+    setBusy(true)
+    setMessage("")
+    try {
+      await fn()
+      await refresh()
+      setMessage(`${label} done`)
+    } catch (e) {
+      setMessage(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const details = async (name: string) => {
+    try {
+      const info = await showModel(name)
+      setSelected(`${name}\n${info.modelfile ?? ""}\n${info.parameters ?? ""}`)
+    } catch (e) {
+      setMessage(String(e))
+    }
+  }
+
+  if (!connected) return <p className="empty-note">Not connected to the engine.</p>
+
+  return (
+    <div className="stack">
+      <h3>Installed models</h3>
+      <button className="btn" disabled={busy} onClick={() => void refresh()}>Refresh</button>
+      <div className="model-list">
+        {models.map((m) => (
+          <div key={m.name} className="model-row">
+            <button className="link" onClick={() => void details(m.name)}>{m.name}</button>
+            <span className="muted">
+              {String(m.details?.parameter_size ?? "?")} · {String(m.details?.quantization_level ?? "?")}
+            </span>
+          </div>
+        ))}
+        {!models.length && <p className="empty-note">No models installed.</p>}
+      </div>
+
+      <h3>Running</h3>
+      <div className="model-list">
+        {running.map((m) => (
+          <div key={m.name} className="model-row">
+            <span>{m.name}</span>
+            <span className="muted">{m.expires_at ? `until ${m.expires_at}` : "resident"}</span>
+          </div>
+        ))}
+        {!running.length && <p className="empty-note">Nothing resident.</p>}
+      </div>
+
+      <h3>Copy / delete / push</h3>
+      <input aria-label="Copy source" placeholder="source model" value={source} onChange={(e) => setSource(e.target.value)} />
+      <input aria-label="Copy destination" placeholder="new name" value={destination} onChange={(e) => setDestination(e.target.value)} />
+      <div className="row">
+        <button className="btn" disabled={busy || !source || !destination}
+          onClick={() => void act("Copy", () => copyModel(source, destination))}>Copy</button>
+        <button className="btn" disabled={busy || !source}
+          onClick={() => void act("Delete", () => deleteModel(source))}>Delete</button>
+        <button className="btn" disabled={busy || !source}
+          onClick={() => void act("Push", () => pushModel(source))}>Push</button>
+      </div>
+
+      <h3>Pull</h3>
+      <input aria-label="Model to pull" placeholder="model or owner/repo" value={pull} onChange={(e) => setPull(e.target.value)} />
+      <button className="btn" disabled={busy || !pull} onClick={() => void act("Pull", async () => setMessage(await pullModel(pull)))}>
+        Pull
+      </button>
+
+      <h3>Create from Modelfile</h3>
+      <input aria-label="New model name" placeholder="new model name" value={createName} onChange={(e) => setCreateName(e.target.value)} />
+      <textarea aria-label="Modelfile" rows={5} value={modelfile} onChange={(e) => setModelfile(e.target.value)} />
+      <button className="btn" disabled={busy || !createName} onClick={() =>
+        void act("Create", () => createModel(createName, { modelfile }))}>Create</button>
+
+      <h3>Embed</h3>
+      <input aria-label="Text to embed" placeholder="text to embed" value={embedText} onChange={(e) => setEmbedText(e.target.value)} />
+      <button className="btn" disabled={busy || !embedText || !models.length} onClick={() =>
+        void act("Embed", async () => {
+          const vectors = await embed(models[0].name, [embedText])
+          setMessage(`${vectors.length} vector(s), ${vectors[0]?.length ?? 0} dimensions`)
+        })}>Embed</button>
+
+      {selected && <pre className="code-block">{selected}</pre>}
+      {message && <p className="muted">{message}</p>}
+    </div>
   )
 }
 

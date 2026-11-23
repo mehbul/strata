@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::expert::ExpertPlan;
 use crate::placement::{resolve_path, Placement};
 use crate::runner::{Flags, Runner};
 
@@ -46,6 +47,9 @@ pub struct Tuned {
     /// exists so a measured placement can outlive the process that found it.
     #[serde(default)]
     pub expert_override: Option<String>,
+    /// Dense models offload whole layers via `-ngl`; MoE models use cpu-moe.
+    #[serde(default)]
+    pub gpu_layers: Option<usize>,
     /// Decode rate, tokens per second.
     pub tok_s: f32,
     /// Prompt-ingest rate, tokens per second. Absent in files written before
@@ -119,7 +123,7 @@ fn sized_prompt(tokens: u32) -> String {
     s
 }
 
-async fn measure(endpoint: &str) -> Result<Perf> {
+pub async fn measure(endpoint: &str) -> Result<Perf> {
     let client = reqwest::Client::new();
 
     // Prefill: a prompt this process has never seen, answered in a single
@@ -218,19 +222,19 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     let ram = 20u64 * 1024 * 1024 * 1024;
     let placed = Placement::solve(&path, ctx, vram, ram)?;
     let layers = placed.facts.layers;
+    let dense = placed.expert_count == 0;
     let mut derived = Flags::derive(&placed);
     derived.kv_type = kv_type.clone();
 
-    // Around half the layers is where this class of model tends to peak, so
-    // bracket that rather than sweeping uniformly from zero.
-    let mut candidates: Vec<usize> = [0.0, 0.3, 0.4, 0.5, 0.6, 0.75]
-        .iter()
-        .map(|f| ((layers as f32) * f).round() as usize)
-        .collect();
-    candidates.push(derived.cpu_moe_layers);
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates.retain(|&c| c < layers);
+    // MoE: sweep how many layers keep their experts in host RAM. Dense: sweep
+    // how many whole layers stay on the GPU — the same shape of search, a
+    // different knob. Both bracket the middle rather than sweeping uniformly.
+    let candidates = sweep_candidates(
+        layers,
+        dense,
+        derived.gpu_layers,
+        derived.cpu_moe_layers,
+    );
 
     println!(
         "Tuning {} at ctx {} (KV cache {})",
@@ -238,14 +242,16 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         ctx,
         kv_type.as_deref().unwrap_or("f16")
     );
+    let knob = if dense { "gpu-layers" } else { "cpu-moe" };
+    let estimate = if dense { derived.gpu_layers } else { derived.cpu_moe_layers };
     println!(
         "{} layers, {} experts each; derived estimate is {}",
-        layers, placed.facts.experts, derived.cpu_moe_layers
+        layers, placed.facts.experts, estimate
     );
     println!("Optimising for a {PREFILL_TOKENS}-token read plus a {DECODE_TOKENS}-token answer.\n");
     println!(
         "{:>10}  {:>12}  {:>11}  {:>9}  {:>9}",
-        "cpu-moe", "prefill tok/s", "decode tok/s", "turn s", "VRAM GB"
+        knob, "prefill tok/s", "decode tok/s", "turn s", "VRAM GB"
     );
     println!("{:->60}", "");
 
@@ -258,12 +264,14 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     // on it.
     let mut queue = candidates.clone();
     let mut refined = false;
-    while let Some(cpu_moe) = queue.pop() {
-        if done.contains(&cpu_moe) || cpu_moe >= layers {
+    while let Some(candidate) = queue.pop() {
+        if done.contains(&candidate) || (dense && candidate > layers) || (!dense && candidate >= layers) {
             if queue.is_empty() && !refined {
                 refined = true;
                 if let Some((b, _)) = &best {
-                    queue = neighbours(b.cpu_moe_layers, layers, &done);
+                    let centre = if dense { b.gpu_layers.unwrap_or(0) } else { b.cpu_moe_layers };
+                    queue = neighbours(centre, layers, &done);
+                    if dense { queue.retain(|&n| n > 0 && n <= layers); }
                     if !queue.is_empty() {
                         println!("{:->60}", "");
                     }
@@ -271,10 +279,15 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
             }
             continue;
         }
-        done.push(cpu_moe);
+        done.push(candidate);
 
         let mut flags = derived.clone();
-        flags.cpu_moe_layers = cpu_moe;
+        if dense {
+            flags.gpu_layers = candidate;
+            flags.cpu_moe_layers = 0;
+        } else {
+            flags.cpu_moe_layers = candidate;
+        }
         flags.ctx = ctx;
 
         let outcome = async {
@@ -286,12 +299,12 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    println!("{cpu_moe:>10}  start failed: {e}");
+                    println!("{candidate:>10}  start failed: {e}");
                     return None;
                 }
             };
             if runner.wait_ready(Duration::from_secs(600)).await.is_err() {
-                println!("{cpu_moe:>10}  {:>12}", "no load");
+                println!("{candidate:>10}  {:>12}", "no load");
                 return None;
             }
             let vram_gb = vram_of(runner.pid());
@@ -305,7 +318,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
                 let turn = perf.turn_seconds();
                 let improved = best.as_ref().map_or(true, |(_, p)| turn < p.turn_seconds());
                 println!(
-                    "{cpu_moe:>10}  {:>12.0}  {:>11.1}  {turn:>9.1}  {vram_gb:>9.2}{}",
+                    "{candidate:>10}  {:>12.0}  {:>11.1}  {turn:>9.1}  {vram_gb:>9.2}{}",
                     perf.prefill_tok_s,
                     perf.decode_tok_s,
                     if improved { " <-- best" } else { "" }
@@ -313,7 +326,8 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
                 if improved {
                     best = Some((
                         Tuned {
-                            cpu_moe_layers: cpu_moe,
+                            cpu_moe_layers: if dense { 0 } else { candidate },
+                            gpu_layers: if dense { Some(candidate) } else { None },
                             ctx,
                             flash_attention: flags.flash_attention,
                             threads: flags.threads,
@@ -329,7 +343,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
                     ));
                 }
             } else {
-                println!("{cpu_moe:>10}  {:>12}", "failed");
+                println!("{candidate:>10}  {:>12}", "failed");
             }
         }
 
@@ -341,13 +355,19 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     // can express non-contiguous expert placement (e.g. only early layers'
     // experts on the CPU) that -ncmoe cannot. Keep the best if it beats the
     // sweep winner.
-    let candidate_patterns: Vec<&str> = vec![r"blk\.\d+\.ffn_.*_exps=CPU"];
-    // Only attempt pattern search if we have a baseline.
-    if best.is_some() {
+    // Expert patterns are meaningful only when the model has routed experts.
+    let candidate_patterns: Vec<String> = if dense {
+        Vec::new()
+    } else {
+        best.as_ref()
+            .map(|(winner, _)| ot_candidates(winner.cpu_moe_layers, layers))
+            .unwrap_or_default()
+    };
+    if best.is_some() && !candidate_patterns.is_empty() {
         for pat in candidate_patterns {
             let mut flags = derived.clone();
             flags.cpu_moe_layers = 0;
-            flags.expert_override = Some(pat.to_string());
+            flags.expert_override = Some(pat.clone());
             flags.ctx = ctx;
 
             let outcome = async {
@@ -383,7 +403,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
                     );
                     if turn < cur_turn {
                         let mut t = best.as_ref().unwrap().0.clone();
-                        t.expert_override = Some(pat.to_string());
+                        t.expert_override = Some(pat.clone());
                         t.cpu_moe_layers = 0;
                         t.tok_s = perf.decode_tok_s;
                         t.prefill_tok_s = perf.prefill_tok_s;
@@ -396,22 +416,23 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
-        // Save best.
-        let (best_tuned, _) = best.as_ref().unwrap();
-        if keep {
-            let out = tuned_path(&path, ctx, kv_type.as_deref());
-            std::fs::write(&out, serde_json::to_string_pretty(&best_tuned)?)?;
-            println!("\nSaved to {}", out.display());
-        }
-        println!(
-            "\nBest: cpu-moe {}  pattern {:?}  ->  {:.1} tok/s decode, {:.0} tok/s prefill, turn {:.1}s",
-            best_tuned.cpu_moe_layers,
-            best_tuned.expert_override,
-            best_tuned.tok_s,
-            best_tuned.prefill_tok_s,
-            best_tuned.turn_s
-        );
     }
+
+    // Save best, whichever knob was swept.
+    let (best_tuned, _) = best.as_ref().unwrap();
+    if keep {
+        let out = tuned_path(&path, ctx, kv_type.as_deref());
+        std::fs::write(&out, serde_json::to_string_pretty(&best_tuned)?)?;
+        println!("\nSaved to {}", out.display());
+    }
+    println!(
+        "\nBest: {knob} {}  pattern {:?}  ->  {:.1} tok/s decode, {:.0} tok/s prefill, turn {:.1}s",
+        if dense { best_tuned.gpu_layers.unwrap_or(0) } else { best_tuned.cpu_moe_layers },
+        best_tuned.expert_override,
+        best_tuned.tok_s,
+        best_tuned.prefill_tok_s,
+        best_tuned.turn_s
+    );
 
     let Some((best, _perf)) = best else {
         bail!("no configuration produced tokens")
@@ -420,8 +441,102 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     Ok(())
 }
 
+/// Layer counts to measure, for either kind of model.
+fn sweep_candidates(layers: usize, dense: bool, derived_gpu: usize, derived_cpu: usize) -> Vec<usize> {
+    let fractions: &[f32] = if dense {
+        &[0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0]
+    } else {
+        &[0.0, 0.3, 0.4, 0.5, 0.6, 0.75]
+    };
+    let mut out: Vec<usize> = fractions
+        .iter()
+        .map(|f| ((layers as f32) * f).round().max(1.0) as usize)
+        .collect();
+    out.push(if dense { derived_gpu } else { derived_cpu });
+    out.sort_unstable();
+    out.dedup();
+    if dense {
+        out.retain(|&c| c > 0 && c <= layers);
+    } else {
+        out.retain(|&c| c < layers);
+    }
+    out
+}
+
+/// Non-prefix expert placements worth measuring with `-ot`.
+///
+/// `-ncmoe` already covers every prefix of layers, so only plans with a gap or
+/// an offset can improve on the sweep winner. Generated from `ExpertPlan` so
+/// the layer regex is the same one the runtime will be given.
+fn ot_candidates(winner_cpu: usize, layers: usize) -> Vec<String> {
+    let n = winner_cpu.min(layers);
+    let base: Vec<usize> = (0..n).collect();
+    let mut plans = vec![
+        ExpertPlan::from_layers((0..layers).step_by(2), layers),
+        ExpertPlan::from_layers((1..layers).step_by(2), layers),
+        ExpertPlan::from_layers((0..layers).step_by(3), layers),
+    ];
+    for start in [1, 2, 3] {
+        if start + n <= layers {
+            plans.push(ExpertPlan::from_layers(start..start + n, layers));
+        }
+    }
+    for layer in [
+        n.saturating_sub(2),
+        n.saturating_sub(1),
+        n,
+        (n + 1).min(layers.saturating_sub(1)),
+    ] {
+        let mut without = base.clone();
+        without.retain(|&l| l != layer);
+        plans.push(ExpertPlan::from_layers(without, layers));
+        let mut with = base.clone();
+        with.push(layer);
+        plans.push(ExpertPlan::from_layers(with, layers));
+    }
+    let mut seen = std::collections::HashSet::new();
+    plans
+        .into_iter()
+        .filter(|p| p.as_first_n().is_none())
+        .filter_map(|p| p.to_override())
+        .filter(|pat| seen.insert(pat.clone()))
+        .collect()
+}
+
 /// Splits either side of `centre` that have not been measured yet, nearest
 /// first, for the refinement pass.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_tuning_sweeps_gpu_layers_including_all_of_them() {
+        let dense = sweep_candidates(32, true, 22, 0);
+        assert!(dense.contains(&32), "all-on-GPU must be measured for dense models");
+        assert!(dense.contains(&22));
+        assert!(dense.iter().all(|&n| n > 0 && n <= 32));
+
+        let moe = sweep_candidates(32, false, 99, 15);
+        assert!(moe.contains(&15));
+        assert!(moe.iter().all(|&n| n < 32));
+    }
+
+    #[test]
+    fn the_ot_search_only_proposes_non_prefix_plans() {
+        let patterns = ot_candidates(15, 41);
+        assert!(patterns.len() > 3, "expected a real search, got {patterns:?}");
+        assert!(patterns.iter().all(|p| p.starts_with(r"blk\.(")));
+        assert!(patterns.iter().all(|p| p.ends_with(r"\.ffn_.*_exps\.=CPU")));
+        let mut unique = patterns.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), patterns.len());
+        // The measured prefix must not reappear as a regex: -ncmoe owns it.
+        let prefix = ExpertPlan::first_n(15, 41).to_override().unwrap();
+        assert!(!patterns.contains(&prefix));
+    }
+}
+
 fn neighbours(centre: usize, layers: usize, done: &[usize]) -> Vec<usize> {
     let mut out = Vec::new();
     for delta in [1isize, 2] {

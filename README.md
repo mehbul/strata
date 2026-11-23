@@ -60,6 +60,15 @@ Then fetch a model and serve:
 
 The kernels are not Strata's. Everything around them is.
 
+Strata is not MoE-only. Dense transformers (llama, qwen2, gemma, mistral…),
+hybrid state-space models and MoE models all use the same GGUF reader, tokenizer,
+registry and API. What changes is placement: MoE tuning chooses how many layers
+keep their routed experts in host RAM, while dense tuning sweeps `-ngl` — how
+many whole layers stay on the GPU, with the rest streamed from host memory.
+Ollama registry pulls bring the model's own system prompt and parameters across
+for every architecture; a Go-template chat template from the registry is kept
+for `strata show` but not forced onto llama.cpp's Jinja engine.
+
 ⚠️ The **expert map** in the console is **simulated**. The compute process does
 not report which experts a token activated, so there is nothing real to draw.
 `/experts` and `/health` return `"simulated": true`, and the console says so.
@@ -338,20 +347,38 @@ point the tool at `http://127.0.0.1:8080/v1` and give it any non-empty key.
 
 ## Commands
 
+The CLI is Ollama-shaped: positional model names, `run`, `stop`, `ps`,
+`create -f`, `launch`, `signin`/`signout` and the same global `--verbose`,
+`--nowordwrap` and host flags (`STRATA_HOST` / `OLLAMA_HOST`). The old
+`--model` spellings still work. Ollama environment variables are honoured:
+`OLLAMA_HOST`, `OLLAMA_MODELS`, `OLLAMA_CONTEXT_LENGTH`,
+`OLLAMA_KV_CACHE_TYPE`, `OLLAMA_KEEP_ALIVE`, `OLLAMA_API_KEY`,
+`OLLAMA_DEBUG` and `OLLAMA_MAX_LOADED_MODELS`. With the last set above 1,
+several models stay resident in separate compute processes, requests are
+routed by model name, and the least-recently-used one is evicted. Model names
+may be logical Ollama tags (`team/model:tag`);
+they are stored in `rocm/models/tags.json`. `strata tune` now measures
+non-prefix `-ot` expert placements as well as the usual `-ncmoe` sweep.
+`strata tokenize` and `strata dequant` expose Strata's own BPE and Q4_K/Q6_K
+decoders; both are checked against the bundled llama.cpp tools/vectors.
+
 | | |
 |---|---|
-| `setup [--model <m>] [--force] [--dry-run] [--allow-disk]` | detect this machine, choose a context, measure the split |
-| `info` | detected hardware and toolchain |
-| `list` | models on disk, read from their GGUF headers |
-| `models` | installed models as the registry sees them: arch, experts, context, size |
-| `inspect --path <gguf>` | everything a model file declares about itself |
-| `plan --model <m> [--ctx] [--vram] [--ram]` | where the weights would sit |
-| `tune --model <m> [--ctx] [--kv-type T] [--save]` | measure the fastest split on this machine |
-| `pull --model <m>` | fetch a model: an Ollama name, or `owner/repo[:file.gguf]` from Hugging Face |
+| `list` / `models` | models on disk and the registry's view of them |
+| `show <model> [--modelfile\|--template\|--license\|--parameters]` | one model's declared facts |
+| `create <name> -f <Modelfile>` or `--from <model>` | derive a model; Modelfile lines are applied at serve time |
+| `run <model> [prompt] [--format] [--keepalive] [--think]` | interactive shell or one-shot answer |
+| `stop <model>` | unload a model; frees the GPU |
+| `ps [--json]` | models currently loaded by the server |
+| `pull <model>` | fetch straight from Ollama's registry, an existing local blob store, or `owner/repo[:file.gguf]` on Hugging Face |
+| `push <model> [--registry] [--token] [--insecure]` | push to a Docker Registry v2 endpoint |
+| `signin [--token] [--registry]` / `signout` | store or remove a registry token |
+| `cp <source> <destination>` / `rm <model>` | copy or remove a model |
+| `launch [console]` | open the web console |
 | `serve --model <m> [--ctx] [--cpu-moe N] [--no-compact] [--kv-type T] [--api-key K]` | load and serve |
-| `switch --url <u> <model> [--api-key K]` | ask a running server to load a different model |
-| `bench [--url] [--model] [--prompt-tokens N] [--output-tokens N] [--json F]` | measure a running instance: TTFT, prefill, decode |
-| `mcp` | run as an MCP server over stdio |
+| `setup`, `info`, `doctor`, `inspect`, `plan`, `tune`, `bench`, `mcp`, `switch` | engine tooling |
+| `daemon start\|stop\|status`, `install`, `update`, `config` | background server and installation |
+| `tokenize`, `dequant`, `quantize`, `split`, `merge`, `gc` | model utilities |
 
 `serve` also takes `--draft` and `--spec` (speculative decoding), `--mmproj`
 (vision; auto-detected from the model directory when absent), `--devices` and
@@ -371,14 +398,20 @@ cache reserved at load is VRAM the experts cannot have — a split measured at
 |---|---|
 | `GET /v1/models` | model list |
 | `POST /v1/chat/completions` | OpenAI chat, SSE when `stream: true` |
+| `POST /v1/completions` | OpenAI's legacy text-completion dialect |
+| `POST /v1/responses` | OpenAI Responses API (streaming events) |
 | `GET /health` | scheduler, model residency, context, tiers, hardware |
 | `GET /metrics` | Prometheus text format: requests, tokens, scheduler, TTFT |
 | `GET /compact` | compaction settings and what it has done |
 | `GET /profile` | per-turn timing |
 | `GET /experts` | expert grid (**simulated**) |
+| `POST /api/embed`, `/api/embeddings` | embeddings (needs a runtime built with embeddings enabled) |
 | `GET /api/models`, `/api/models/current` | installed models, and which is resident |
 | `POST /api/models/load`, `/api/models/unload` | switch the active model, or free the GPU |
 | `POST /model/load`, `POST /model/unload` | free and reclaim the GPU |
+| `POST /api/copy`, `DELETE /api/delete`, `POST /api/create` | Ollama's model-management surface |
+| `POST /api/pull`, `/api/push` | pull and push models through the same code as the CLI |
+| `HEAD/POST /api/blobs/:digest` | content-addressed blob store with verified SHA-256 |
 
 `/health` reports `tiers` from the placement solve, not from the simulated
 expert grid, and labels the source. On a dense model `expert_count` is 0 and the
@@ -399,6 +432,16 @@ x-strata-compacted-tokens  4100    how much was reclaimed
 Fields Strata does not model — `tools`, `stop`, `top_p`, `seed`,
 `response_format` — are forwarded untouched, so an editor or coding agent
 behaves as it would talking to llama.cpp directly.
+
+Ollama's own request fields are handled rather than dropped: `think` toggles
+the chat template's thinking flag (and passes `low`/`medium`/`high`/`max`
+through as `reasoning_effort`), `message.thinking` and `message.tool_name`
+survive translation, `format: "json"` or a JSON schema becomes
+`response_format`, and `keep_alive` schedules a real unload — `0` unloads now,
+`-1` keeps the weights resident. `/api/tags`, `/api/ps` and `/api/show` report
+parameter size, quantisation, families, context and embedding length read from
+the GGUF, not placeholder strings. The one derived value is parameter size,
+summed from tensor element counts.
 
 ---
 
@@ -491,6 +534,9 @@ turn after a compaction costs 0.3s to first token instead of 199s.
 
 Longer documents behind the decisions above:
 
+- [Ollama reverse-engineering dossier](docs/OLLAMA-RE.md) — REA evidence from
+  the shipped Ollama 0.40.16 binary, its live API, and the parity gaps this
+  release closes.
 - [Engine notes](docs/LEARNING.md) — the model these choices were measured
   against, why placement and tuning work the way they do, and what is intended
   but not built.
