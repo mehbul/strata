@@ -2258,6 +2258,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         // endpoint answers in the wrong shape, so both dialects are served here
         // rather than left to the caller to proxy.
         .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/api/chat", post(ollama_chat))
         .route("/api/generate", post(ollama_generate))
         .route("/api/tags", get(ollama_tags))
@@ -2281,6 +2282,15 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             state.clone(),
             require_key,
         ))
+        .layer(axum::middleware::from_fn(|request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let method = request.method().clone();
+            let uri = request.uri().clone();
+            let response = next.run(request).await;
+            if !response.status().is_success() {
+                eprintln!("strata: {method} {uri} -> {}", response.status());
+            }
+            response
+        }))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
@@ -2782,6 +2792,49 @@ async fn anthropic_messages(State(state): State<Shared>, Json(req): Json<Value>)
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Anthropic's token-count endpoint, used by Claude Code before a request.
+/// Counts with Strata's own BPE over the same text the chat adapter will send.
+async fn anthropic_count_tokens(State(state): State<Shared>, Json(req): Json<Value>) -> Json<Value> {
+    let model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let path = crate::registry::resolve(&state.models_root, &model).or_else(|| {
+        let current = state.model.lock().unwrap().clone();
+        crate::registry::resolve(&state.models_root, &current)
+    });
+    let mut text = String::new();
+    if let Some(system) = req.get("system").and_then(Value::as_str) {
+        text.push_str(system);
+        text.push('\n');
+    }
+    if let Some(msgs) = req.get("messages").and_then(Value::as_array) {
+        for message in msgs {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            let content = match message.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => String::new(),
+            };
+            text.push_str(role);
+            text.push_str(": ");
+            text.push_str(&content);
+            text.push('\n');
+        }
+    }
+    let count = path
+        .and_then(|p| crate::tokenizer::Tokenizer::from_gguf(&p.to_string_lossy()).ok())
+        .and_then(|t| t.encode(&text).ok())
+        .map(|ids| ids.len())
+        .unwrap_or_else(|| text.len().div_ceil(4));
+    Json(json!({ "count": count }))
 }
 
 fn anthropic_error(status: u16, message: &str) -> Response {

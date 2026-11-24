@@ -375,6 +375,8 @@ decoders; both are checked against the bundled llama.cpp tools/vectors.
 | `signin [--token] [--registry]` / `signout` | store or remove a registry token |
 | `cp <source> <destination>` / `rm <model>` | copy or remove a model |
 | `launch [console]` | open the web console |
+| `launch claude --model <m> [-- <args>]` | launch Claude Code against Strata's Anthropic endpoint |
+| `launch pi --model <m> [-- <args>]` / `launch opencode --model <m>` | launch other agents against Strata |
 | `serve --model <m> [--ctx] [--cpu-moe N] [--no-compact] [--kv-type T] [--api-key K]` | load and serve |
 | `setup`, `info`, `doctor`, `inspect`, `plan`, `tune`, `bench`, `mcp`, `switch` | engine tooling |
 | `daemon start\|stop\|status`, `install`, `update`, `config` | background server and installation |

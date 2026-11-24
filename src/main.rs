@@ -84,6 +84,51 @@ fn env_api_key() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Run a CLI agent. On Windows the npm-installed tools are `.ps1` shims, which
+/// CreateProcess cannot execute directly; go through PowerShell there.
+fn run_agent(
+    program: &str,
+    envs: &[(&str, String)],
+    args: &[String],
+) -> Result<std::process::ExitStatus> {
+    if cfg!(windows) {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let command = format!(
+            "& {}",
+            std::iter::once(program.to_string())
+                .chain(args.iter().cloned())
+                .map(|a| quote(&a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command]);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.status().map_err(Into::into)
+    } else {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.status().map_err(Into::into)
+    }
+}
+
+fn open_url(url: &str) {
+    println!("Opening {url} (the integration must already be installed)");
+    let result = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", "start", url]).status()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).status()
+    };
+    if result.is_err() {
+        println!("Open this address in a browser: {url}");
+    }
+}
+
 /// Resolve a positional argument or its long-flag alias.
 fn either(positional: Option<String>, flag: Option<String>, what: &str) -> Result<String> {
     positional
@@ -354,12 +399,17 @@ enum Commands {
         #[arg(long)]
         purge: bool,
     },
-    /// Launch the web console or an integration
+    /// Launch the web console or an integration, configured for Strata
     Launch {
         #[arg(value_name = "APP")]
         app: Option<String>,
         #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
         host: Option<String>,
+        /// Extra arguments passed to the launched agent
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Ask a running server to load a different model
     Switch {
@@ -814,29 +864,46 @@ async fn main() -> Result<()> {
                 println!("{} blob(s){}", stale.len(), if purge { " purged" } else { " (use --purge to delete)" });
             }
         }
-        Commands::Launch { app, host: launch_host } => {
-            let url = format!("{}/", launch_host.unwrap_or(host).trim_end_matches('/'));
+        Commands::Launch { app, model, host: launch_host, args } => {
+            let base = launch_host.unwrap_or(host).trim_end_matches('/').to_string();
+            let url = format!("{base}/");
             match app.as_deref().unwrap_or("console") {
-                app => {
-                    let target = match app {
-                        "console" | "web" | "ui" | "" => url.clone(),
-                        "open-webui" | "webui" => "http://localhost:3000".into(),
-                        "anythingllm" => "http://localhost:3001".into(),
-                        "librechat" => "http://localhost:3080".into(),
-                        other => bail!(
-                            "unknown app '{other}'. Known: console, open-webui, anythingllm, librechat"
-                        ),
-                    };
-                    println!("Opening {target} (the integration must already be installed)");
-                    let result = if cfg!(windows) {
-                        std::process::Command::new("cmd").args(["/C", "start", &target]).status()
+                "console" | "web" | "ui" | "" => open_url(&url),
+                "open-webui" | "webui" => open_url("http://localhost:3000"),
+                "anythingllm" => open_url("http://localhost:3001"),
+                "librechat" => open_url("http://localhost:3080"),
+                "claude" | "pi" => {
+                    let chosen = either(model, None, "model")?;
+                    let is_claude = app.as_deref() == Some("claude");
+                    let program = if is_claude { "claude" } else { "pi" };
+                    let mut agent_args = vec!["--model".to_string(), chosen.clone()];
+                    agent_args.extend(args);
+                    let envs: Vec<(&str, String)> = if is_claude {
+                        vec![
+                            ("ANTHROPIC_BASE_URL", base.clone()),
+                            ("ANTHROPIC_API_KEY", env_api_key().unwrap_or_else(|| "local".into())),
+                        ]
                     } else {
-                        std::process::Command::new("xdg-open").arg(&target).status()
+                        vec![("STRATA_HOST", base.clone())]
                     };
-                    if result.is_err() {
-                        println!("Open this address in a browser: {target}");
-                    }
+                    println!("launching {program} --model {chosen} against {base}");
+                    let status = run_agent(program, &envs, &agent_args)?;
+                    if !status.success() { bail!("agent exited with {status}") }
                 }
+                "opencode" => {
+                    let mut agent_args = Vec::new();
+                    if let Some(m) = model { agent_args.extend(["--model".to_string(), m]); }
+                    agent_args.extend(args);
+                    let envs = vec![
+                        ("OPENAI_BASE_URL", format!("{base}/v1")),
+                        ("OPENAI_API_KEY", env_api_key().unwrap_or_else(|| "local".into())),
+                    ];
+                    let status = run_agent("opencode", &envs, &agent_args)?;
+                    if !status.success() { bail!("opencode exited with {status}") }
+                }
+                other => bail!(
+                    "unknown app '{other}'. Known: console, claude, pi, opencode, open-webui, anythingllm, librechat"
+                ),
             }
         }
         Commands::Switch { url, model, model_pos, api_key } => {
