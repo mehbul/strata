@@ -338,6 +338,16 @@ impl Gguf {
         self.key(suffix).and_then(|v| v.as_f64())
     }
 
+    /// First integer in an array metadata value. Newer architectures (for
+    /// example `inkling2_loop`) declare head counts per layer rather than as a
+    /// single scalar; the layers are uniform, so the first entry is representative.
+    pub fn key_array_u64_first(&self, suffix: &str) -> Option<u64> {
+        match self.key(suffix) {
+            Some(Value::Array(items)) => items.iter().find_map(|v| v.as_u64()),
+            _ => None,
+        }
+    }
+
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
     }
@@ -414,8 +424,16 @@ impl ModelFacts {
             arch: gguf.arch().to_string(),
             layers: gguf.key_u64("block_count").unwrap_or(0) as usize,
             embedding: gguf.key_u64("embedding_length").unwrap_or(0) as usize,
-            heads: gguf.key_u64("attention.head_count").unwrap_or(0) as usize,
-            kv_heads: gguf.key_u64("attention.head_count_kv").unwrap_or(0) as usize,
+            heads: gguf
+                .key_u64("attention.head_count")
+                .or_else(|| gguf.key_array_u64_first("attention.head_count"))
+                .unwrap_or(0) as usize,
+            kv_heads: gguf
+                .key_u64("attention.head_count_kv")
+                .or_else(|| gguf.key_array_u64_first("attention.head_count_kv"))
+                .unwrap_or_else(|| {
+                    gguf.key_array_u64_first("attention.head_count").unwrap_or(0)
+                }) as usize,
             experts: gguf.key_u64("expert_count").unwrap_or(0) as usize,
             experts_used: gguf.key_u64("expert_used_count").unwrap_or(0) as usize,
             expert_ff: gguf.key_u64("expert_feed_forward_length").unwrap_or(0) as usize,
@@ -644,6 +662,25 @@ pub fn inspect_all(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_layer_head_count_arrays_are_read() {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "inkling2_loop.attention.head_count".into(),
+            Value::Array(vec![Value::U32(24), Value::U32(24)]),
+        );
+        metadata.insert("general.architecture".into(), Value::Str("inkling2_loop".into()));
+        let gguf = Gguf {
+            version: 3,
+            metadata,
+            tensors: Vec::new(),
+            data_offset: 0,
+            file_size: 0,
+        };
+        assert_eq!(gguf.key_array_u64_first("attention.head_count"), Some(24));
+        assert_eq!(gguf.key_u64("attention.head_count"), None);
+    }
 
     #[test]
     fn file_types_match_ollamas_table() {

@@ -181,6 +181,13 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   `ANTHROPIC_BASE_URL` to the server root (Claude Code appends `/v1/messages`),
   `pi` and `opencode` are configured similarly, and `/v1/messages/count_tokens`
   is implemented. Verified live with `claude -p` through Strata.
+- Inkling 2 Mini compatibility: the GGUF reader correctly identifies its
+  `inkling2_loop` architecture, 24 layers, 128 routed experts/top-8, 1M context
+  and `_exps.*` tensors, so Strata's MoE placement path applies. Fixed a KV
+  sizing bug: head counts are per-layer arrays on this architecture, so the
+  scalar-only lookup produced zero KV bytes; the first array entry is now used.
+  Execution still requires llama.cpp b12600+ (PR #32694); the bundled b10679
+  runtime has no `inkling2_loop` support.
 - Final audit items: DONE — converter now emits tokenizer arrays from
   `tokenizer.json` and normalises llama-style architectures; POST/validation
   route tests added; tray process launch and device-code flow verified against
