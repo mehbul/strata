@@ -173,6 +173,10 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   daemon watchdog with logon tasks, web metric meter, TLS crypto provider fix,
   wider safetensors metadata, and more route tests. TLS verified with HTTPS
   curl against a self-signed certificate; raw/suffix verified live.
+- CLI launchers: expanded to every app on Ollama's launch screen (Claude Code,
+  Codex CLI, OpenClaw, OpenCode, Hermes Agent/Desktop, Droid, Pi, Cline,
+  Copilot CLI, Oh My Pi, DeepSeek Harness, Qwen Code, Terminal) with env
+  configuration, executable detection, and clear errors when an app is absent.
 - CLI launchers: DONE — `strata launch claude --model <m>` sets
   `ANTHROPIC_BASE_URL` to the server root (Claude Code appends `/v1/messages`),
   `pi` and `opencode` are configured similarly, and `/v1/messages/count_tokens`

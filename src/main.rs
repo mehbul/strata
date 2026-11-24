@@ -117,6 +117,55 @@ fn run_agent(
     }
 }
 
+/// Find an executable on PATH, including Windows script shims.
+fn find_program(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in [
+            name.to_string(),
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.ps1"),
+        ] {
+            let full = dir.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+/// Env vars and executable for each app on Ollama's launch screen.
+fn launch_spec(app: &str, base: &str, key: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
+    let openai = format!("{base}/v1");
+    let oa = || vec![("OPENAI_BASE_URL", openai.clone()), ("OPENAI_API_KEY", key.to_string())];
+    match app {
+        "claude" | "claude-code" => Some(("claude", vec![
+            ("ANTHROPIC_BASE_URL", base.to_string()),
+            ("ANTHROPIC_API_KEY", key.to_string()),
+        ])),
+        "codex" | "codex-cli" => Some(("codex", oa())),
+        "openclaw" => Some(("openclaw", oa())),
+        "opencode" => Some(("opencode", oa())),
+        "hermes-agent" | "hermes" => Some(("hermes", oa())),
+        "hermes-desktop" => Some(("hermes-desktop", oa())),
+        "droid" => Some(("droid", oa())),
+        "pi" => Some(("pi", vec![("STRATA_HOST", base.to_string())])),
+        "oh-my-pi" => Some(("pi", vec![("STRATA_HOST", base.to_string())])),
+        "cline" => Some(("cline", oa())),
+        "copilot" | "copilot-cli" => Some(("copilot", oa())),
+        "deepseek-harness" => Some(("deepseek", vec![
+            ("DEEPSEEK_API_BASE", openai.clone()),
+            ("DEEPSEEK_API_KEY", key.to_string()),
+            ("OPENAI_BASE_URL", openai),
+            ("OPENAI_API_KEY", key.to_string()),
+        ])),
+        "qwen-code" => Some(("qwen", oa())),
+        _ => None,
+    }
+}
+
 fn open_url(url: &str) {
     println!("Opening {url} (the integration must already be installed)");
     let result = if cfg!(windows) {
@@ -872,38 +921,46 @@ async fn main() -> Result<()> {
                 "open-webui" | "webui" => open_url("http://localhost:3000"),
                 "anythingllm" => open_url("http://localhost:3001"),
                 "librechat" => open_url("http://localhost:3080"),
-                "claude" | "pi" => {
-                    let chosen = either(model, None, "model")?;
-                    let is_claude = app.as_deref() == Some("claude");
-                    let program = if is_claude { "claude" } else { "pi" };
-                    let mut agent_args = vec!["--model".to_string(), chosen.clone()];
-                    agent_args.extend(args);
-                    let envs: Vec<(&str, String)> = if is_claude {
-                        vec![
-                            ("ANTHROPIC_BASE_URL", base.clone()),
-                            ("ANTHROPIC_API_KEY", env_api_key().unwrap_or_else(|| "local".into())),
-                        ]
+                "terminal" => {
+                    let chosen = model.unwrap_or_default();
+                    let mut command = format!(
+                        "set OPENAI_BASE_URL={base}/v1&&set OPENAI_API_KEY={}&&set ANTHROPIC_BASE_URL={base}&&set ANTHROPIC_API_KEY={}&&set STRATA_HOST={base}&&cmd /k",
+                        env_api_key().unwrap_or_else(|| "local".into()),
+                        env_api_key().unwrap_or_else(|| "local".into())
+                    );
+                    if !chosen.is_empty() {
+                        command = format!("set STRATA_MODEL={chosen}&&{command}");
+                    }
+                    let status = if cfg!(windows) {
+                        std::process::Command::new("cmd").args(["/C", &command]).status()?
                     } else {
-                        vec![("STRATA_HOST", base.clone())]
+                        std::process::Command::new("sh").arg("-c").arg(&command).status()?
                     };
-                    println!("launching {program} --model {chosen} against {base}");
+                    if !status.success() { bail!("terminal exited with {status}") }
+                }
+                other => {
+                    let key = env_api_key().unwrap_or_else(|| "local".into());
+                    let Some((program, envs)) = launch_spec(other, &base, &key) else {
+                        bail!(
+                            "unknown app '{other}'. Known: claude, codex, openclaw, opencode, \
+                             hermes-agent, hermes-desktop, droid, pi, cline, copilot, \
+                             oh-my-pi, deepseek-harness, qwen-code, terminal, console, \
+                             open-webui, anythingllm, librechat"
+                        );
+                    };
+                    if find_program(program).is_none() {
+                        bail!("'{program}' is not on PATH. Install it first, then run `strata launch {other}`.");
+                    }
+                    let chosen = model.unwrap_or_default();
+                    let mut agent_args = Vec::new();
+                    if !chosen.is_empty() {
+                        agent_args.extend(["--model".to_string(), chosen.clone()]);
+                    }
+                    agent_args.extend(args);
+                    println!("launching {program} against {base}");
                     let status = run_agent(program, &envs, &agent_args)?;
                     if !status.success() { bail!("agent exited with {status}") }
                 }
-                "opencode" => {
-                    let mut agent_args = Vec::new();
-                    if let Some(m) = model { agent_args.extend(["--model".to_string(), m]); }
-                    agent_args.extend(args);
-                    let envs = vec![
-                        ("OPENAI_BASE_URL", format!("{base}/v1")),
-                        ("OPENAI_API_KEY", env_api_key().unwrap_or_else(|| "local".into())),
-                    ];
-                    let status = run_agent("opencode", &envs, &agent_args)?;
-                    if !status.success() { bail!("opencode exited with {status}") }
-                }
-                other => bail!(
-                    "unknown app '{other}'. Known: console, claude, pi, opencode, open-webui, anythingllm, librechat"
-                ),
             }
         }
         Commands::Switch { url, model, model_pos, api_key } => {
