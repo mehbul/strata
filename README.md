@@ -90,7 +90,7 @@ cargo build --release
 Strata needs a llama.cpp build in `runtime/`. It is not committed.
 
 ```powershell
-curl -L -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b10679/llama-b10679-bin-win-rocm-7.14-x64.zip
+curl -L -o llama.zip https://github.com/ggml-org/llama.cpp/releases/download/b12704/llama-b12704-bin-win-rocm-10.0-x64.zip
 Expand-Archive llama.zip -DestinationPath runtime
 ```
 
@@ -107,9 +107,11 @@ than assuming the GPU is being used.
 
 The ROCm zip ships `ggml-hip.dll` but not all the libraries it imports: it also
 needs `hipblas.dll`, `rocblas.dll`, `libhipblaslt.dll` and the MSVC runtime DLLs
-next to `llama-server.exe`. `install.ps1` copies these from a local Ollama ROCm
-folder or an AMD HIP SDK, and refuses to finish when no GPU is listed. For a
-manual setup, point `STRATA_ROCM_LIBS` at a directory containing them.
+next to `llama-server.exe`, plus a `rocblas/library/` folder with the Tensile
+kernels (without it the server crashes on load). `install.ps1` copies these from
+a local Ollama ROCm folder or an AMD HIP SDK, and refuses to finish when no GPU
+is listed. For a manual setup, point `STRATA_ROCM_LIBS` at a directory containing
+them.
 
 ### 3. Get a model
 

@@ -186,8 +186,12 @@ Evidence and gap analysis: `docs/OLLAMA-RE.md`.
   and `_exps.*` tensors, so Strata's MoE placement path applies. Fixed a KV
   sizing bug: head counts are per-layer arrays on this architecture, so the
   scalar-only lookup produced zero KV bytes; the first array entry is now used.
-  Execution still requires llama.cpp b12600+ (PR #32694); the bundled b10679
-  runtime has no `inkling2_loop` support.
+  Execution requires llama.cpp b12600+ (PR #32694); the bundled runtime was
+  upgraded from b10679 to b12704, which supports `inkling2_loop`. Tensor sizes
+  are now read from GGUF offsets instead of a block-layout table, so type40
+  expert weights are counted (the old estimate saw 4.78 GiB of a 15.47 GiB
+  file). Ollama's `manifests-v2` layout is resolved on pull, and a projector
+  shipped as a second Ollama layer is copied into the model directory.
 - Final audit items: DONE — converter now emits tokenizer arrays from
   `tokenizer.json` and normalises llama-style architectures; POST/validation
   route tests added; tray process launch and device-code flow verified against

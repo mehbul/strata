@@ -22,6 +22,12 @@ versioning](https://semver.org/): 0.x releases may break between minors.
 - `strata bench` sizes its prompt with the model's own tokenizer and reports the
   requested and observed token counts.
 - Clippy is clean with `-D warnings` on all targets.
+- Compute runtime pinned to llama.cpp b12704 (ROCm 10.0), which supports the
+  `inkling2_loop` architecture; Inkling 2 Mini can now be served and tuned.
+- GGUF tensor sizes come from index offsets, so custom quant types such as the
+  type40 expert weights are counted in placement and tuning.
+- Pull resolves Ollama's `manifests-v2` store and copies a model's vision
+  projector beside the weights.
 
 ## [0.1.0] — 2026-11-17
 

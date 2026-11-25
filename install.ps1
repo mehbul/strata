@@ -7,8 +7,8 @@
 
 $ErrorActionPreference = "Stop"
 
-$LlamaBuild = "b10679"
-$LlamaZip = "llama-$LlamaBuild-bin-win-rocm-7.14-x64.zip"
+$LlamaBuild = "b12704"
+$LlamaZip = "llama-$LlamaBuild-bin-win-rocm-10.0-x64.zip"
 $LlamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/$LlamaZip"
 
 # Windows PowerShell 5.1 turns any native command's stderr into an error
@@ -118,6 +118,22 @@ foreach ($pair in $pairs) {
         if (Test-Path $candidate) {
             Copy-Item $candidate $target -Force
             Say "copied $($pair[0]) from $src"
+            break
+        }
+    }
+}
+
+# b12704's ROCm build also loads Tensile kernels from rocblas/library beside the
+# binary. The release zip does not contain them: without this folder the server
+# crashes during model load with "Cannot read .../rocblas/library/TensileLibrary.dat".
+$tensile = Join-Path $runtimeDir "rocblas\library"
+if (-not (Test-Path $tensile)) {
+    foreach ($src in $sources) {
+        $candidate = Join-Path $src "rocblas\library"
+        if (Test-Path $candidate) {
+            New-Item -ItemType Directory -Path (Split-Path $tensile -Parent) -Force | Out-Null
+            Copy-Item -LiteralPath $candidate -Destination $tensile -Recurse -Force
+            Say "copied rocblas\library from $src"
             break
         }
     }

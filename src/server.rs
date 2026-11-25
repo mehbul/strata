@@ -1924,6 +1924,10 @@ pub struct ServeOptions {
     pub compact: bool,
     /// KV cache element type, e.g. `q8_0`. `None` leaves it at f16.
     pub kv_type: Option<String>,
+    pub threads_batch: Option<usize>,
+    pub load_mode: Option<String>,
+    pub moe_cache_mib: Option<u64>,
+    pub moe_cache_cpu_share: Option<f32>,
     /// Required on every API request when set. Binding anywhere but loopback
     /// without one is refused.
     pub api_key: Option<String>,
@@ -1948,6 +1952,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         upstream,
         compact,
         kv_type,
+        threads_batch,
+        load_mode,
+        moe_cache_mib,
+        moe_cache_cpu_share,
         api_key,
         draft,
         spec,
@@ -2021,6 +2029,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         (None, Some(model_path), Some(p)) => {
             let mut flags = crate::runner::Flags::derive(p);
             flags.kv_type = kv_type.clone();
+            flags.threads_batch = threads_batch;
+            flags.load_mode = load_mode.clone();
+            flags.moe_cache_mib = moe_cache_mib;
+            flags.moe_cache_cpu_share = moe_cache_cpu_share;
             flags.draft_model = draft.as_ref().map(std::path::PathBuf::from);
             flags.spec = spec;
             flags.mmproj = mmproj.as_ref().map(std::path::PathBuf::from);

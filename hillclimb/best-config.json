@@ -1,0 +1,26 @@
+{
+  "name": "cand-q8",
+  "status": "accepted (labelled lossy: q8_0 KV cache)",
+  "accepted_at": "2026-11-25",
+  "server_args": [
+    "serve", "--model", "inkling-2-mini:chat", "--ctx", "32768",
+    "--kv-type", "q8_0"
+  ],
+  "tuned_file": "rocm/models/inkling-2-mini_chat/tuned-32768-q8_0.json",
+  "kv_type": "q8_0",
+  "cpu_moe_layers": 7,
+  "expert_override": null,
+  "flash_attention": true,
+  "threads": 6,
+  "bench_config": "configs/cand-q8.json",
+  "measured": {
+    "c1_decode_median": 23.17,
+    "c2_aggregate": 22.57,
+    "prefill_4096": 218.3,
+    "prefill_16384": 136.8,
+    "long_prefill": 133.7,
+    "needle_retrieval": "3/3",
+    "flags": []
+  },
+  "verdict": "beats both neighbouring controls on c1/c2 with no >3% regression"
+}

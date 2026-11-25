@@ -143,6 +143,19 @@ pub struct Flags {
     pub gpu_layers: usize,
     pub flash_attention: bool,
     pub threads: usize,
+    /// CPU threads for prompt/batch work. Separate from decode threads so a
+    /// long prefill does not steal the sampling thread's core.
+    pub threads_batch: Option<usize>,
+    /// Model loading mode. `none` avoids mmap, which matters when expert tensors
+    /// are overridden to CPU: page faults then cost a read per expert instead
+    /// of the weights being resident in host memory.
+    pub load_mode: Option<String>,
+    /// GPU cache in MiB for routed experts whose weights stay in host RAM.
+    /// llama.cpp promotes the experts an answer keeps using into this cache,
+    /// the same hot-set idea specialized MoE engines apply.
+    pub moe_cache_mib: Option<u64>,
+    /// Share of MoE cache misses computed on the CPU instead of uploaded.
+    pub moe_cache_cpu_share: Option<f32>,
     /// A non-prefix expert placement, rendered as an `-ot` pattern.
     ///
     /// `None` for every plan the runtime can already express as `-ncmoe`,
@@ -204,6 +217,10 @@ impl Flags {
                 .map(|n| n.get() / 2)
                 .unwrap_or(6)
                 .max(1),
+            threads_batch: None,
+            load_mode: None,
+            moe_cache_mib: None,
+            moe_cache_cpu_share: None,
             expert_override: None,
             kv_type: None,
             draft_model: None,
@@ -255,6 +272,25 @@ impl Flags {
             // `chat_template_kwargs`, has nothing to reach.
             "--jinja".into(),
         ];
+        if let Some(n) = self.threads_batch {
+            args.push("-tb".into());
+            args.push(n.to_string());
+        }
+        if let Some(mode) = &self.load_mode {
+            args.push("--load-mode".into());
+            args.push(mode.clone());
+        }
+        // Hot-expert cache for the layers whose weights stay in host RAM.
+        // `--moe-cache-mib` and `--moe-cache-cpu-share` are separate so they can
+        // be measured one at a time.
+        if let Some(mib) = self.moe_cache_mib {
+            args.push("--moe-cache-mib".into());
+            args.push(mib.to_string());
+        }
+        if let Some(share) = self.moe_cache_cpu_share {
+            args.push("--moe-cache-cpu-share".into());
+            args.push(share.to_string());
+        }
         // A pattern replaces the count rather than adding to it; passing both
         // would place the same tensors twice by two different rules.
         match &self.expert_override {
@@ -518,6 +554,10 @@ mod tests {
             gpu_layers: 99,
             flash_attention: true,
             threads: 6,
+            threads_batch: None,
+            load_mode: None,
+            moe_cache_mib: None,
+            moe_cache_cpu_share: None,
             expert_override: None,
             kv_type: None,
             draft_model: None,
@@ -531,6 +571,24 @@ mod tests {
             batch: None,
             ubatch: None,
         }
+    }
+
+    /// llama.cpp's MoE expert cache and the no-mmap load mode are the two
+    /// llama.cpp equivalents of the hot-expert caching used by specialized MoE
+    /// engines. They must survive the trip from Flags to the command line.
+    #[test]
+    fn expert_cache_and_load_mode_reach_the_compute_process() {
+        let mut flags = base();
+        flags.moe_cache_mib = Some(512);
+        flags.moe_cache_cpu_share = Some(0.25);
+        flags.load_mode = Some("none".into());
+        flags.threads_batch = Some(8);
+        let args = flags.to_args(Path::new("model.gguf"), 8080);
+        let pos = |name: &str| args.iter().position(|a| a == name).unwrap();
+        assert_eq!(args[pos("--moe-cache-mib") + 1], "512");
+        assert_eq!(args[pos("--moe-cache-cpu-share") + 1], "0.25");
+        assert_eq!(args[pos("--load-mode") + 1], "none");
+        assert_eq!(args[pos("-tb") + 1], "8");
     }
 
     #[test]

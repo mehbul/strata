@@ -75,6 +75,18 @@ impl Hub {
             self.say(format!("     {} -> {}", blob.display(), dest.display()));
             std::fs::copy(&blob, &dest)
                 .with_context(|| format!("copying {} to {}", blob.display(), dest.display()))?;
+            // Vision models ship the projector as a second Ollama layer. Strata
+            // discovers it by name in the model directory, so give it one.
+            if let Some(projector) = ollama_projector(model) {
+                let proj_dest = out.join("model.mmproj.gguf");
+                self.say(format!(
+                    "     {} -> {}",
+                    projector.display(),
+                    proj_dest.display()
+                ));
+                std::fs::copy(&projector, &proj_dest)
+                    .with_context(|| format!("copying projector to {}", proj_dest.display()))?;
+            }
             return Ok(out);
         }
 
@@ -499,27 +511,41 @@ fn ollama_blob(model: &str) -> Option<PathBuf> {
     ollama_blob_in(&ollama_root()?, model)
 }
 
+/// The projector shipped beside `name[:tag]`, when the model has one.
+fn ollama_projector(model: &str) -> Option<PathBuf> {
+    ollama_layer_in(
+        &ollama_root()?,
+        model,
+        "application/vnd.ollama.image.projector",
+    )
+}
+
 /// The blob a store at `root` holds for `name[:tag]`, found through its manifests.
-///
-/// Ollama names blobs by their digest, so the manifest tree is the only thing
-/// that says which blob is which model. Taking the largest GGUF instead - as
-/// this used to - answers every pull with whatever the biggest model on the
-/// machine happens to be, filed under whatever name was asked for. It also
-/// cannot tell a model from the projector shipped beside it.
 fn ollama_blob_in(root: &Path, model: &str) -> Option<PathBuf> {
+    ollama_layer_in(root, model, "application/vnd.ollama.image.model")
+}
+
+/// A named layer of `name[:tag]`, found through Ollama's manifests.
+///
+/// Ollama names blobs by digest, so the manifest tree is the only thing that
+/// says which blob is which model. Taking the largest GGUF instead - as this
+/// used to - answers every pull with whatever the biggest model on the machine
+/// happens to be. Newer Ollama releases write `manifests-v2` rather than
+/// `manifests`; both layouts are checked so a locally cached model is reused
+/// instead of being downloaded from the registry again.
+fn ollama_layer_in(root: &Path, model: &str, media_type: &str) -> Option<PathBuf> {
     let (name, tag) = match model.split_once(':') {
         Some((n, t)) => (n.to_lowercase(), Some(t.to_lowercase())),
         None => (model.to_lowercase(), None),
     };
-    let manifest = find_manifest(&root.join("manifests"), &name, tag.as_deref())?;
+    let manifest = find_manifest(&root.join("manifests"), &name, tag.as_deref())
+        .or_else(|| find_manifest(&root.join("manifests-v2"), &name, tag.as_deref()))?;
     let json: Value = serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
     let digest = json
         .get("layers")?
         .as_array()?
         .iter()
-        .find(|l| {
-            l.get("mediaType").and_then(Value::as_str) == Some("application/vnd.ollama.image.model")
-        })?
+        .find(|l| l.get("mediaType").and_then(Value::as_str) == Some(media_type))?
         .get("digest")?
         .as_str()?
         .replace(':', "-");
@@ -632,6 +658,50 @@ mod tests {
             .ends_with("sha256-bbb"));
         assert!(ollama_blob_in(&root, "not-here:1b").is_none());
         assert!(ollama_blob_in(&root, "small-one:70b").is_none());
+        assert!(ollama_layer_in(
+            &root,
+            "small-one:3b",
+            "application/vnd.ollama.image.projector"
+        )
+        .unwrap()
+        .ends_with("sha256-aaapro"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ollama 0.40 stores its manifests under `manifests-v2`; that is where
+    /// this machine's Inkling 2 Mini lives.
+    #[test]
+    fn a_v2_manifest_tree_resolves_the_model_and_its_projector() {
+        let root = std::env::temp_dir().join("strata-hub-v2-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = root
+            .join("manifests-v2")
+            .join("ollama.com")
+            .join("library")
+            .join("inkling-2-mini");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(
+            lib.join("chat"),
+            r#"{"layers":[
+                {"mediaType":"application/vnd.ollama.image.model","digest":"sha256:ddd"},
+                {"mediaType":"application/vnd.ollama.image.projector","digest":"sha256:dddpro"}
+            ]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("blobs").join("sha256-ddd"), b"GGUF").unwrap();
+        std::fs::write(root.join("blobs").join("sha256-dddpro"), b"GGUF").unwrap();
+
+        assert!(ollama_blob_in(&root, "inkling-2-mini:chat")
+            .unwrap()
+            .ends_with("sha256-ddd"));
+        assert!(ollama_layer_in(
+            &root,
+            "inkling-2-mini:chat",
+            "application/vnd.ollama.image.projector"
+        )
+        .unwrap()
+        .ends_with("sha256-dddpro"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

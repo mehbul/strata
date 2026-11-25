@@ -76,26 +76,6 @@ impl GgmlType {
         }
     }
 
-    /// (elements per block, bytes per block). k-quants use 256-element blocks.
-    pub fn block(&self) -> Option<(usize, usize)> {
-        Some(match self {
-            Self::F32 => (1, 4),
-            Self::F16 | Self::BF16 => (1, 2),
-            Self::Q4_0 => (32, 18),
-            Self::Q4_1 => (32, 20),
-            Self::Q5_0 => (32, 22),
-            Self::Q5_1 => (32, 24),
-            Self::Q8_0 => (32, 34),
-            Self::Q8_1 => (32, 36),
-            Self::Q2K => (256, 84),
-            Self::Q3K => (256, 110),
-            Self::Q4K => (256, 144),
-            Self::Q5K => (256, 176),
-            Self::Q6K => (256, 210),
-            Self::Q8K => (256, 292),
-            Self::Other(_) => return None,
-        })
-    }
 }
 
 /// A metadata value. GGUF's own type tags, kept lossless.
@@ -163,12 +143,6 @@ pub struct TensorInfo {
 impl TensorInfo {
     pub fn elements(&self) -> u64 {
         self.dims.iter().product::<u64>().max(1)
-    }
-    /// Stored size in bytes, or None for a type we do not know the layout of.
-    pub fn bytes(&self) -> Option<u64> {
-        let (per_block, block_bytes) = self.kind.block()?;
-        let n = self.elements();
-        Some((n / per_block as u64) * block_bytes as u64)
     }
 }
 
@@ -352,18 +326,39 @@ impl Gguf {
         self.tensors.iter().find(|t| t.name == name)
     }
 
-    /// Total stored bytes of all tensors whose layout we understand.
+    /// Real stored size of one tensor, taken from the index rather than from a
+    /// block-layout table.
+    ///
+    /// Sizing from a block-layout table needs to know a quantisation's layout.
+    /// Newer architectures ship types we do not have a table for (Inkling 2's
+    /// expert weights are `type40`), so those tensors used to count as zero
+    /// bytes and placement believed the whole model fit in VRAM. GGUF stores tensors
+    /// contiguously in index order, so the next tensor's offset is this one's
+    /// true end. Padding between tensors is counted as part of the preceding
+    /// tensor, which is the correct conservative accounting for residency.
+    pub fn stored_bytes(&self, idx: usize) -> u64 {
+        let t = &self.tensors[idx];
+        let end = self
+            .tensors
+            .get(idx + 1)
+            .map(|next| next.offset)
+            .unwrap_or(self.file_size);
+        end.saturating_sub(t.offset)
+    }
+
+    /// Total stored bytes of every tensor, including quantisations whose block
+    /// layout we do not know.
     pub fn tensor_bytes(&self) -> u64 {
-        self.tensors.iter().filter_map(|t| t.bytes()).sum()
+        (0..self.tensors.len()).map(|i| self.stored_bytes(i)).sum()
     }
 
     /// How many bytes sit in each quantisation, largest first.
     pub fn by_type(&self) -> Vec<(String, usize, u64)> {
         let mut acc: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-        for t in &self.tensors {
+        for (i, t) in self.tensors.iter().enumerate() {
             let e = acc.entry(t.kind.name()).or_insert((0, 0));
             e.0 += 1;
-            e.1 += t.bytes().unwrap_or(0);
+            e.1 += self.stored_bytes(i);
         }
         let mut out: Vec<_> = acc.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
         out.sort_by_key(|(_, _, b)| std::cmp::Reverse(*b));
@@ -691,6 +686,36 @@ mod tests {
         };
         assert_eq!(gguf.key_array_u64_first("attention.head_count"), Some(24));
         assert_eq!(gguf.key_u64("attention.head_count"), None);
+    }
+
+    /// Inkling 2's expert tensors are type40, which has no block layout in the
+    /// reader. Their size must still be accounted for in placement.
+    #[test]
+    fn unknown_quant_tensors_are_sized_from_the_index() {
+        let gguf = Gguf {
+            version: 3,
+            metadata: std::collections::BTreeMap::new(),
+            tensors: vec![
+                TensorInfo {
+                    name: "blk.0.ffn_gate_up_exps.weight".into(),
+                    dims: vec![2304, 2304, 128],
+                    kind: GgmlType::Other(40),
+                    offset: 100,
+                },
+                TensorInfo {
+                    name: "blk.1.ffn_gate_up_exps.weight".into(),
+                    dims: vec![2304, 2304, 128],
+                    kind: GgmlType::Other(40),
+                    offset: 1_600_000_100,
+                },
+            ],
+            data_offset: 100,
+            file_size: 3_200_000_000,
+        };
+        assert_eq!(gguf.stored_bytes(0), 1_600_000_000);
+        assert_eq!(gguf.stored_bytes(1), 1_599_999_900);
+        assert_eq!(gguf.tensor_bytes(), 3_199_999_900);
+        assert_eq!(gguf.by_type()[0].2, 3_199_999_900);
     }
 
     #[test]

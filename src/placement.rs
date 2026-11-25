@@ -105,8 +105,11 @@ impl Placement {
         // expert (`*_shexp.*`) is dense — it runs for every token.
         let mut expert_bytes = 0u64;
         let mut total = 0u64;
-        for t in &gguf.tensors {
-            let bytes = t.bytes().unwrap_or(0);
+        for (i, t) in gguf.tensors.iter().enumerate() {
+            // From the tensor index, not the quantisation table: Inkling 2's
+            // experts are type40 and have no known block layout. Counting them
+            // as zero made a 15 GiB model look like a 5 GiB one.
+            let bytes = gguf.stored_bytes(i);
             total += bytes;
             if t.name.contains("_exps.") {
                 expert_bytes += bytes;

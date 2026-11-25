@@ -267,6 +267,9 @@ enum DaemonAction {
 }
 
 #[derive(Subcommand)]
+// A CLI enum is built once at startup; boxing the Serve variant to shave a few
+// bytes would add indirection to every dispatch for no measurable benefit.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Detect this machine, pick a context that fits it, and measure the
     /// fastest expert split for it. Run this once after cloning.
@@ -564,6 +567,19 @@ enum Commands {
         no_compact: bool,
         #[arg(long)]
         kv_type: Option<String>,
+        /// CPU threads for prompt processing (defaults to the decode count)
+        #[arg(long)]
+        threads_batch: Option<usize>,
+        /// Model loading mode: auto, none or mmap. `none` keeps CPU-expert
+        /// weights resident instead of paging them from the GGUF.
+        #[arg(long)]
+        load_mode: Option<String>,
+        /// GPU cache in MiB for routed experts held in host RAM
+        #[arg(long)]
+        moe_cache_mib: Option<u64>,
+        /// Share of MoE cache misses computed on the CPU instead of uploaded
+        #[arg(long)]
+        moe_cache_cpu_share: Option<f32>,
         #[arg(long)]
         api_key: Option<String>,
         #[arg(long)]
@@ -1341,6 +1357,10 @@ async fn main() -> Result<()> {
             upstream,
             no_compact,
             kv_type,
+            threads_batch,
+            load_mode,
+            moe_cache_mib,
+            moe_cache_cpu_share,
             api_key,
             draft,
             spec,
@@ -1366,6 +1386,10 @@ async fn main() -> Result<()> {
                 upstream,
                 compact: !no_compact,
                 kv_type: kv_type.or_else(env_kv_type),
+                threads_batch,
+                load_mode,
+                moe_cache_mib,
+                moe_cache_cpu_share,
                 api_key: api_key.or_else(env_api_key),
                 draft,
                 spec,
