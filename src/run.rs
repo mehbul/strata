@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 
 fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -20,8 +20,16 @@ fn base64(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((n >> 18) & 63) as usize] as char);
         out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -66,18 +74,9 @@ impl Session {
         req
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self
-            .client
-            .get(format!("{}{path}", self.host.trim_end_matches('/')));
-        if let Some(key) = &self.key {
-            req = req.bearer_auth(key);
-        }
-        req
-    }
-
     async fn complete(&mut self, text: &str) -> Result<()> {
-        self.history.push(json!({ "role": "user", "content": text }));
+        self.history
+            .push(json!({ "role": "user", "content": text }));
         if let Some(path) = &self.image {
             match std::fs::read(path) {
                 Ok(bytes) => {
@@ -146,12 +145,16 @@ impl Session {
             while let Some(pos) = buf.find("\n\n") {
                 let frame: String = buf.drain(..pos + 2).collect();
                 for line in frame.lines() {
-                    let Some(payload) = line.strip_prefix("data:") else { continue };
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
                     let payload = payload.trim_start();
                     if payload == "[DONE]" {
                         continue;
                     }
-                    let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+                    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                        continue;
+                    };
                     if let Some(u) = v.get("usage") {
                         if u.get("completion_tokens").is_some() {
                             usage = u.clone();
@@ -162,7 +165,9 @@ impl Session {
                         .and_then(|c| c.as_array())
                         .and_then(|c| c.first())
                         .and_then(|c| c.get("delta"))
-                    else { continue };
+                    else {
+                        continue;
+                    };
                     if let Some(s) = delta.get("content").and_then(Value::as_str) {
                         if !s.is_empty() {
                             if first_token.is_none() {
@@ -193,8 +198,14 @@ impl Session {
         if self.verbose {
             let total = start.elapsed();
             let first = first_token.unwrap_or(total);
-            let eval = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let eval = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let prompt = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let rate = if total.as_secs_f64() > 0.0 {
                 eval as f64 / total.as_secs_f64()
             } else {
@@ -209,7 +220,6 @@ impl Session {
         }
         Ok(())
     }
-
 }
 
 /// Wait until the server answers /health, or 120 seconds pass.
@@ -306,7 +316,10 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
                 .send()
                 .await?;
             let body: Value = resp.json().await.unwrap_or(json!({}));
-            println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
         }
         "/pull" => {
             let name = line.split_whitespace().nth(1).unwrap_or("");
@@ -318,15 +331,14 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
         }
         "/save-model" => {
             let dest = line.split_whitespace().nth(1).unwrap_or("");
-            crate::registry::copy(
-                &crate::registry::default_root(),
-                &session.model,
-                dest,
-            )?;
+            crate::registry::copy(&crate::registry::default_root(), &session.model, dest)?;
             println!("saved as {dest}");
         }
         "/save" => {
-            let path = line.split_whitespace().nth(1).unwrap_or("conversation.json");
+            let path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("conversation.json");
             let body = json!({
                 "model": session.model,
                 "history": session.history,
@@ -337,9 +349,16 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
             println!("saved conversation to {path}");
         }
         "/load" => {
-            let path = line.split_whitespace().nth(1).unwrap_or("conversation.json");
+            let path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("conversation.json");
             let body: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-            if let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_string) {
+            if let Some(model) = body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
                 session.model = model;
             }
             session.history = body
@@ -358,9 +377,7 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
             let mut parts = line.split_whitespace().skip(1);
             match (parts.next(), parts.next()) {
                 (Some("think"), Some(v)) => session.think = Some(matches!(v, "on" | "true" | "1")),
-                (Some("verbose"), Some(v)) => {
-                    session.verbose = matches!(v, "on" | "true" | "1")
-                }
+                (Some("verbose"), Some(v)) => session.verbose = matches!(v, "on" | "true" | "1"),
                 (Some("format"), Some(v)) => session.format = Some(v.to_string()),
                 (Some("temperature"), Some(v)) => session.temperature = v.parse().ok(),
                 (Some("max-tokens"), Some(v)) => session.max_tokens = v.parse().ok(),
@@ -373,17 +390,21 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    session.history.retain(|m| {
-                        m.get("role").and_then(Value::as_str) != Some("system")
-                    });
+                    session
+                        .history
+                        .retain(|m| m.get("role").and_then(Value::as_str) != Some("system"));
                     if !text.is_empty() {
-                        session.history.insert(0, json!({ "role": "system", "content": text }));
+                        session
+                            .history
+                            .insert(0, json!({ "role": "system", "content": text }));
                         session.system = Some(text);
                     } else {
                         session.system = None;
                     }
                 }
-                _ => println!("usage: /set think|verbose|format|system|temperature|max-tokens|top-p <value>"),
+                _ => println!(
+                    "usage: /set think|verbose|format|system|temperature|max-tokens|top-p <value>"
+                ),
             }
         }
         _ => println!("unknown command: {line}"),
@@ -393,7 +414,9 @@ async fn slash(session: &mut Session, line: &str) -> Result<bool> {
 
 pub async fn run(args: RunArgs) -> Result<()> {
     ensure_server(&args.host, &args.model).await?;
-    let key = std::env::var("STRATA_API_KEY").ok().filter(|k| !k.trim().is_empty());
+    let key = std::env::var("STRATA_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
     let mut session = Session {
         client: reqwest::Client::new(),
         host: args.host.clone(),

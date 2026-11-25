@@ -49,13 +49,17 @@ pub fn export_bundle(model: &str, output: &str) -> Result<()> {
     }
     let status = Command::new("tar")
         .args([
-            "-czf", output,
-            "-C", root.to_str().unwrap_or("."),
+            "-czf",
+            output,
+            "-C",
+            root.to_str().unwrap_or("."),
             dir.file_name().unwrap_or_default().to_str().unwrap_or("."),
         ])
         .status()
         .with_context(|| "running tar")?;
-    if !status.success() { bail!("tar export failed") }
+    if !status.success() {
+        bail!("tar export failed")
+    }
     println!("wrote {output}");
     Ok(())
 }
@@ -67,7 +71,9 @@ pub fn import_bundle(input: &str) -> Result<()> {
         .args(["-xzf", input, "-C", root.to_str().unwrap_or(".")])
         .status()
         .with_context(|| "running tar")?;
-    if !status.success() { bail!("tar import failed") }
+    if !status.success() {
+        bail!("tar import failed")
+    }
     println!("imported {input}");
     Ok(())
 }

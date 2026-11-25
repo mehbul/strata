@@ -187,15 +187,18 @@ impl Flags {
         let free_for_experts = p
             .vram_budget
             .saturating_sub(p.dense_bytes + p.kv_bytes + reserve);
-        let gpu_expert_layers = if per_layer_experts > 0 {
-            (free_for_experts / per_layer_experts) as usize
-        } else {
-            layers
-        };
+        let gpu_expert_layers = free_for_experts
+            .checked_div(per_layer_experts)
+            .map(|n| n as usize)
+            .unwrap_or(layers);
         Self {
             ctx: p.ctx,
             cpu_moe_layers: layers.saturating_sub(gpu_expert_layers.min(layers)),
-            gpu_layers: if p.expert_count > 0 { 99 } else { p.gpu_layers() },
+            gpu_layers: if p.expert_count > 0 {
+                99
+            } else {
+                p.gpu_layers()
+            },
             flash_attention: true,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get() / 2)
@@ -344,7 +347,6 @@ pub fn loader_path(runtime: &Runtime) -> Option<std::ffi::OsString> {
 pub struct Runner {
     child: Child,
     pub endpoint: String,
-    pub flags: Flags,
     pub runtime: Runtime,
     /// The tail of what the compute process wrote to stderr. Kept because
     /// llama.cpp reports a missing rocBLAS, a bad `-ncmoe` or an out-of-memory
@@ -417,7 +419,6 @@ impl Runner {
         Ok(Self {
             child,
             endpoint: format!("http://127.0.0.1:{port}"),
-            flags,
             runtime,
             log,
         })

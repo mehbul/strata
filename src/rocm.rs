@@ -98,7 +98,6 @@ pub struct RocmInfo {
     pub hip_path: PathBuf,
     pub amdhip_dll: PathBuf,
     pub gfx: Option<String>,
-    pub device_name: Option<String>,
     pub torch_version: Option<String>,
     pub hip_version: Option<String>,
 }
@@ -132,7 +131,7 @@ pub fn detect() -> Result<RocmInfo> {
         let mut lines = text.lines().map(|l| l.trim().to_string());
         Some((lines.next(), lines.next(), lines.next()))
     });
-    let (device_name, hip_version, torch_version) = match torch {
+    let (_, hip_version, torch_version) = match torch {
         Some((d, h, t)) => (d.filter(|s| !s.is_empty()), h.filter(|s| !s.is_empty()), t),
         None => (None, None, None),
     };
@@ -177,7 +176,6 @@ pub fn detect() -> Result<RocmInfo> {
         hip_path,
         amdhip_dll: amdhip,
         gfx,
-        device_name,
         torch_version,
         hip_version,
     })
@@ -262,11 +260,6 @@ pub fn print_info() -> Result<()> {
     Ok(())
 }
 
-/// Returns the HIP SDK root, used as HIP_SDK_ROOT.
-pub fn hip_sdk_root() -> PathBuf {
-    local_hip_path()
-}
-
 /// Returns true if using vendored ROCm (self-contained)
 pub fn is_vendored() -> bool {
     let vendored = vendored_hip_sdk();
@@ -317,10 +310,10 @@ pub fn vram_total_gb() -> f32 {
 pub fn sdk_search_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut push = |dir: PathBuf| {
-        if dir.join("rocblas.dll").exists() || dir.join("librocblas.so").exists() {
-            if !out.contains(&dir) {
-                out.push(dir);
-            }
+        if (dir.join("rocblas.dll").exists() || dir.join("librocblas.so").exists())
+            && !out.contains(&dir)
+        {
+            out.push(dir);
         }
     };
     if let Ok(custom) = std::env::var("STRATA_ROCM_BIN") {

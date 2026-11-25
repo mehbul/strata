@@ -229,12 +229,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     // MoE: sweep how many layers keep their experts in host RAM. Dense: sweep
     // how many whole layers stay on the GPU — the same shape of search, a
     // different knob. Both bracket the middle rather than sweeping uniformly.
-    let candidates = sweep_candidates(
-        layers,
-        dense,
-        derived.gpu_layers,
-        derived.cpu_moe_layers,
-    );
+    let candidates = sweep_candidates(layers, dense, derived.gpu_layers, derived.cpu_moe_layers);
 
     println!(
         "Tuning {} at ctx {} (KV cache {})",
@@ -243,7 +238,11 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         kv_type.as_deref().unwrap_or("f16")
     );
     let knob = if dense { "gpu-layers" } else { "cpu-moe" };
-    let estimate = if dense { derived.gpu_layers } else { derived.cpu_moe_layers };
+    let estimate = if dense {
+        derived.gpu_layers
+    } else {
+        derived.cpu_moe_layers
+    };
     println!(
         "{} layers, {} experts each; derived estimate is {}",
         layers, placed.facts.experts, estimate
@@ -265,13 +264,22 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     let mut queue = candidates.clone();
     let mut refined = false;
     while let Some(candidate) = queue.pop() {
-        if done.contains(&candidate) || (dense && candidate > layers) || (!dense && candidate >= layers) {
+        if done.contains(&candidate)
+            || (dense && candidate > layers)
+            || (!dense && candidate >= layers)
+        {
             if queue.is_empty() && !refined {
                 refined = true;
                 if let Some((b, _)) = &best {
-                    let centre = if dense { b.gpu_layers.unwrap_or(0) } else { b.cpu_moe_layers };
+                    let centre = if dense {
+                        b.gpu_layers.unwrap_or(0)
+                    } else {
+                        b.cpu_moe_layers
+                    };
                     queue = neighbours(centre, layers, &done);
-                    if dense { queue.retain(|&n| n > 0 && n <= layers); }
+                    if dense {
+                        queue.retain(|&n| n > 0 && n <= layers);
+                    }
                     if !queue.is_empty() {
                         println!("{:->60}", "");
                     }
@@ -316,7 +324,7 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
         if let Some((perf, vram_gb)) = outcome {
             if perf.decode_tok_s > 0.0 && perf.prefill_tok_s > 0.0 {
                 let turn = perf.turn_seconds();
-                let improved = best.as_ref().map_or(true, |(_, p)| turn < p.turn_seconds());
+                let improved = best.as_ref().is_none_or(|(_, p)| turn < p.turn_seconds());
                 println!(
                     "{candidate:>10}  {:>12.0}  {:>11.1}  {turn:>9.1}  {vram_gb:>9.2}{}",
                     perf.prefill_tok_s,
@@ -415,7 +423,6 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-
     }
 
     // Save best, whichever knob was swept.
@@ -427,7 +434,11 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
     }
     println!(
         "\nBest: {knob} {}  pattern {:?}  ->  {:.1} tok/s decode, {:.0} tok/s prefill, turn {:.1}s",
-        if dense { best_tuned.gpu_layers.unwrap_or(0) } else { best_tuned.cpu_moe_layers },
+        if dense {
+            best_tuned.gpu_layers.unwrap_or(0)
+        } else {
+            best_tuned.cpu_moe_layers
+        },
         best_tuned.expert_override,
         best_tuned.tok_s,
         best_tuned.prefill_tok_s,
@@ -442,7 +453,12 @@ pub async fn run(model: &str, ctx: usize, kv_type: Option<String>, keep: bool) -
 }
 
 /// Layer counts to measure, for either kind of model.
-fn sweep_candidates(layers: usize, dense: bool, derived_gpu: usize, derived_cpu: usize) -> Vec<usize> {
+fn sweep_candidates(
+    layers: usize,
+    dense: bool,
+    derived_gpu: usize,
+    derived_cpu: usize,
+) -> Vec<usize> {
     let fractions: &[f32] = if dense {
         &[0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0]
     } else {
@@ -503,40 +519,6 @@ fn ot_candidates(winner_cpu: usize, layers: usize) -> Vec<String> {
         .collect()
 }
 
-/// Splits either side of `centre` that have not been measured yet, nearest
-/// first, for the refinement pass.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dense_tuning_sweeps_gpu_layers_including_all_of_them() {
-        let dense = sweep_candidates(32, true, 22, 0);
-        assert!(dense.contains(&32), "all-on-GPU must be measured for dense models");
-        assert!(dense.contains(&22));
-        assert!(dense.iter().all(|&n| n > 0 && n <= 32));
-
-        let moe = sweep_candidates(32, false, 99, 15);
-        assert!(moe.contains(&15));
-        assert!(moe.iter().all(|&n| n < 32));
-    }
-
-    #[test]
-    fn the_ot_search_only_proposes_non_prefix_plans() {
-        let patterns = ot_candidates(15, 41);
-        assert!(patterns.len() > 3, "expected a real search, got {patterns:?}");
-        assert!(patterns.iter().all(|p| p.starts_with(r"blk\.(")));
-        assert!(patterns.iter().all(|p| p.ends_with(r"\.ffn_.*_exps\.=CPU")));
-        let mut unique = patterns.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), patterns.len());
-        // The measured prefix must not reappear as a regex: -ncmoe owns it.
-        let prefix = ExpertPlan::first_n(15, 41).to_override().unwrap();
-        assert!(!patterns.contains(&prefix));
-    }
-}
-
 fn neighbours(centre: usize, layers: usize, done: &[usize]) -> Vec<usize> {
     let mut out = Vec::new();
     for delta in [1isize, 2] {
@@ -560,4 +542,44 @@ fn now_utc() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("unix:{secs}")
+}
+
+/// Splits either side of `centre` that have not been measured yet, nearest
+/// first, for the refinement pass.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_tuning_sweeps_gpu_layers_including_all_of_them() {
+        let dense = sweep_candidates(32, true, 22, 0);
+        assert!(
+            dense.contains(&32),
+            "all-on-GPU must be measured for dense models"
+        );
+        assert!(dense.contains(&22));
+        assert!(dense.iter().all(|&n| n > 0 && n <= 32));
+
+        let moe = sweep_candidates(32, false, 99, 15);
+        assert!(moe.contains(&15));
+        assert!(moe.iter().all(|&n| n < 32));
+    }
+
+    #[test]
+    fn the_ot_search_only_proposes_non_prefix_plans() {
+        let patterns = ot_candidates(15, 41);
+        assert!(
+            patterns.len() > 3,
+            "expected a real search, got {patterns:?}"
+        );
+        assert!(patterns.iter().all(|p| p.starts_with(r"blk\.(")));
+        assert!(patterns.iter().all(|p| p.ends_with(r"\.ffn_.*_exps\.=CPU")));
+        let mut unique = patterns.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), patterns.len());
+        // The measured prefix must not reappear as a regex: -ncmoe owns it.
+        let prefix = ExpertPlan::first_n(15, 41).to_override().unwrap();
+        assert!(!patterns.contains(&prefix));
+    }
 }

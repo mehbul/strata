@@ -11,6 +11,17 @@ $LlamaBuild = "b10679"
 $LlamaZip = "llama-$LlamaBuild-bin-win-rocm-7.14-x64.zip"
 $LlamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaBuild/$LlamaZip"
 
+# Windows PowerShell 5.1 turns any native command's stderr into an error
+# record. With ErrorActionPreference=Stop, cargo's ordinary progress output
+# would abort the install. Run native commands with the preference relaxed.
+function Invoke-Native($file, [string[]] $arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $file @arguments }
+    finally { $ErrorActionPreference = $previous }
+    return $LASTEXITCODE
+}
+
 function Say($msg) { Write-Host "  $msg" }
 function Step($msg) { Write-Host "`n$msg" -ForegroundColor Cyan }
 function Fail($msg) {
@@ -44,8 +55,8 @@ if (Test-Path "strata\Cargo.toml") {
     Say "strata\ already present, using it"
     Set-Location strata
 } else {
-    git clone --depth 1 https://github.com/mehbul/strata
-    if ($LASTEXITCODE -ne 0) { Fail "git clone failed" }
+    $code = Invoke-Native git @('clone', '--depth', '1', 'https://github.com/mehbul/strata')
+    if ($code -ne 0) { Fail "git clone failed" }
     Set-Location strata
     Say "cloned into .\strata"
 }
@@ -58,30 +69,80 @@ if (Test-Path "runtime\llama-server.exe") {
 } else {
     Say "downloading llama.cpp $LlamaBuild for ROCm (about 1 GB)"
     $zip = Join-Path $env:TEMP $LlamaZip
-    curl.exe -L --fail -o "$zip" "$LlamaUrl"
-    if ($LASTEXITCODE -ne 0) { Fail "download failed: $LlamaUrl" }
+    $code = Invoke-Native 'curl.exe' @('-L', '--fail', '-o', $zip, $LlamaUrl)
+    if ($code -ne 0) { Fail "download failed: $LlamaUrl" }
     Expand-Archive -Path "$zip" -DestinationPath "runtime" -Force
     Remove-Item "$zip" -ErrorAction SilentlyContinue
     Say "extracted to runtime\"
 }
 
+# The ROCm zip ships ggml-hip.dll but NOT the BLAS libraries it imports. Without
+# them LoadLibrary fails with error 126, --list-devices prints "(none)" and every
+# benchmark silently runs on the CPU. Provision them from a local ROCm install
+# before checking the device list.
+Step "Checking ROCm support libraries"
+$runtimeDir = Join-Path (Get-Location).Path "runtime"
+$sources = @()
+if ($env:STRATA_ROCM_LIBS) { $sources += $env:STRATA_ROCM_LIBS }
+foreach ($root in @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Ollama\lib\ollama"),
+    (Join-Path $env:ProgramFiles "AMD\ROCm"),
+    (Join-Path ${env:ProgramFiles(x86)} "AMD\ROCm")
+)) {
+    if (-not (Test-Path $root)) { continue }
+    Get-ChildItem $root -Directory -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "rocblas.dll") } |
+        ForEach-Object { $sources += $_.FullName }
+}
+# (target name, source name) pairs. Never overwrite amdhip64_7.dll or
+# amd_comgr.dll: the runtime's own 7.14 copies are the ones ggml-hip needs.
+$pairs = @(
+    @("hipblas.dll", "libhipblas.dll"),
+    @("hipblas.dll", "hipblas.dll"),
+    @("rocblas.dll", "rocblas.dll"),
+    @("hipblaslt.dll", "libhipblaslt.dll"),
+    @("libhipblaslt.dll", "libhipblaslt.dll"),
+    @("msvcp140.dll", "msvcp140.dll"),
+    @("msvcp140_1.dll", "msvcp140_1.dll"),
+    @("msvcp140_2.dll", "msvcp140_2.dll"),
+    @("vcruntime140.dll", "vcruntime140.dll"),
+    @("vcruntime140_1.dll", "vcruntime140_1.dll"),
+    @("concrt140.dll", "concrt140.dll"),
+    @("amd_comgr_3.dll", "amd_comgr_3.dll")
+)
+foreach ($pair in $pairs) {
+    $target = Join-Path $runtimeDir $pair[0]
+    if (Test-Path $target) { continue }
+    foreach ($src in $sources) {
+        $candidate = Join-Path $src $pair[1]
+        if (Test-Path $candidate) {
+            Copy-Item $candidate $target -Force
+            Say "copied $($pair[0]) from $src"
+            break
+        }
+    }
+}
+
 # The whole point of this check: a missing backend library shows up as an empty
 # device list with nothing in the log, and everything silently falls back to CPU.
 Step "Checking the GPU is visible"
-$devices = & ".\runtime\llama-server.exe" --list-devices 2>&1 | Out-String
+$devices = Invoke-Native '.\runtime\llama-server.exe' @('--list-devices') 2>&1 | Out-String
 Write-Host $devices.TrimEnd()
 if ($devices -notmatch "ROCm|Vulkan|CUDA") {
-    Write-Host @"
+    Fail @"
 
-  No GPU was listed. Strata will still build, but inference will run on the CPU
-  and be far slower. A missing backend library is the usual cause.
-"@ -ForegroundColor Yellow
+  No GPU was listed. Inference would run on the CPU, which is not what this
+  engine is for. The ROCm runtime needs hipblas.dll, rocblas.dll and their
+  support DLLs next to llama-server.exe. Set STRATA_ROCM_LIBS to a folder
+  containing them, or install Ollama (which ships a compatible set), then
+  run install.ps1 again.
+"@
 }
 
 # --- build ------------------------------------------------------------------
 Step "Building (this takes a few minutes the first time)"
-cargo build --release
-if ($LASTEXITCODE -ne 0) { Fail "cargo build failed" }
+$code = Invoke-Native cargo @('build', '--release')
+if ($code -ne 0) { Fail "cargo build failed" }
 Say "built target\release\strata.exe"
 
 # --- configure --------------------------------------------------------------
@@ -104,8 +165,8 @@ if ($models.Count -eq 0) {
     exit 0
 }
 
-.\target\release\strata.exe setup
-if ($LASTEXITCODE -ne 0) { Fail "setup failed" }
+$code = Invoke-Native '.\target\release\strata.exe' @('setup')
+if ($code -ne 0) { Fail "setup failed" }
 
 # --- global command ---------------------------------------------------------
 # The engine discovers `runtime\` and `rocm\models\` relative to the working

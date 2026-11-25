@@ -31,12 +31,12 @@ mod run;
 mod runner;
 mod server;
 mod setup;
+mod tokenizer;
 mod tools;
 mod tray;
-mod winservice;
 mod tune;
-mod tokenizer;
 mod updater;
+mod winservice;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -44,12 +44,17 @@ use serde_json::{json, Value};
 use tracing_subscriber::EnvFilter;
 
 fn config_value(key: &str) -> Option<String> {
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
-    let text = std::fs::read_to_string(std::path::Path::new(&home).join(".strata/config.toml")).ok()?;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let text =
+        std::fs::read_to_string(std::path::Path::new(&home).join(".strata/config.toml")).ok()?;
     text.lines()
         .find_map(|line| {
             let line = line.trim();
-            if line.starts_with('#') { return None }
+            if line.starts_with('#') {
+                return None;
+            }
             let (k, v) = line.split_once('=')?;
             (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
         })
@@ -102,7 +107,13 @@ fn run_agent(
                 .join(" ")
         );
         let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command]);
+        cmd.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ]);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -137,14 +148,26 @@ fn find_program(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Env vars and executable for each app on Ollama's launch screen.
-fn launch_spec(app: &str, base: &str, key: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
+fn launch_spec(
+    app: &str,
+    base: &str,
+    key: &str,
+) -> Option<(&'static str, Vec<(&'static str, String)>)> {
     let openai = format!("{base}/v1");
-    let oa = || vec![("OPENAI_BASE_URL", openai.clone()), ("OPENAI_API_KEY", key.to_string())];
+    let oa = || {
+        vec![
+            ("OPENAI_BASE_URL", openai.clone()),
+            ("OPENAI_API_KEY", key.to_string()),
+        ]
+    };
     match app {
-        "claude" | "claude-code" => Some(("claude", vec![
-            ("ANTHROPIC_BASE_URL", base.to_string()),
-            ("ANTHROPIC_API_KEY", key.to_string()),
-        ])),
+        "claude" | "claude-code" => Some((
+            "claude",
+            vec![
+                ("ANTHROPIC_BASE_URL", base.to_string()),
+                ("ANTHROPIC_API_KEY", key.to_string()),
+            ],
+        )),
         "codex" | "codex-cli" => Some(("codex", oa())),
         "openclaw" => Some(("openclaw", oa())),
         "opencode" => Some(("opencode", oa())),
@@ -155,12 +178,15 @@ fn launch_spec(app: &str, base: &str, key: &str) -> Option<(&'static str, Vec<(&
         "oh-my-pi" => Some(("pi", vec![("STRATA_HOST", base.to_string())])),
         "cline" => Some(("cline", oa())),
         "copilot" | "copilot-cli" => Some(("copilot", oa())),
-        "deepseek-harness" => Some(("deepseek", vec![
-            ("DEEPSEEK_API_BASE", openai.clone()),
-            ("DEEPSEEK_API_KEY", key.to_string()),
-            ("OPENAI_BASE_URL", openai),
-            ("OPENAI_API_KEY", key.to_string()),
-        ])),
+        "deepseek-harness" => Some((
+            "deepseek",
+            vec![
+                ("DEEPSEEK_API_BASE", openai.clone()),
+                ("DEEPSEEK_API_KEY", key.to_string()),
+                ("OPENAI_BASE_URL", openai),
+                ("OPENAI_API_KEY", key.to_string()),
+            ],
+        )),
         "qwen-code" => Some(("qwen", oa())),
         _ => None,
     }
@@ -169,7 +195,9 @@ fn launch_spec(app: &str, base: &str, key: &str) -> Option<(&'static str, Vec<(&
 fn open_url(url: &str) {
     println!("Opening {url} (the integration must already be installed)");
     let result = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/C", "start", url]).status()
+        std::process::Command::new("cmd")
+            .args(["/C", "start", url])
+            .status()
     } else {
         std::process::Command::new("xdg-open").arg(url).status()
     };
@@ -630,6 +658,9 @@ enum Commands {
         model: Option<String>,
         #[arg(long, default_value_t = 2048)]
         prompt_tokens: usize,
+        /// GGUF whose tokenizer sizes the prompt (auto-detected from the model)
+        #[arg(long)]
+        tokenizer: Option<String>,
         #[arg(long, default_value_t = 256)]
         output_tokens: usize,
         #[arg(long)]
@@ -645,13 +676,20 @@ async fn main() -> Result<()> {
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on"));
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| if debug { EnvFilter::try_new("debug") } else { EnvFilter::try_new("info") })
+        .or_else(|_| {
+            if debug {
+                EnvFilter::try_new("debug")
+            } else {
+                EnvFilter::try_new("info")
+            }
+        })
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
     if cli.service_run {
-        let listen = std::env::var("STRATA_SERVICE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
+        let listen =
+            std::env::var("STRATA_SERVICE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
         let model = std::env::var("STRATA_SERVICE_MODEL").unwrap_or_default();
         let ctx: usize = std::env::var("STRATA_SERVICE_CTX")
             .ok()
@@ -664,13 +702,14 @@ async fn main() -> Result<()> {
     let host = cli.host.unwrap_or_else(default_host);
 
     match cli.command {
-        Commands::Setup { model, force, dry_run, allow_disk } => {
-            setup::run(model, force, dry_run, allow_disk).await?
-        }
+        Commands::Setup {
+            model,
+            force,
+            dry_run,
+            allow_disk,
+        } => setup::run(model, force, dry_run, allow_disk).await?,
         Commands::Info => rocm::print_info()?,
-        Commands::Doctor { host: doctor_host } => {
-            doctor::run(&doctor_host.unwrap_or(host)).await?
-        }
+        Commands::Doctor { host: doctor_host } => doctor::run(&doctor_host.unwrap_or(host)).await?,
         Commands::List { json } => {
             let entries = registry::scan(&registry::default_root());
             if json {
@@ -681,7 +720,15 @@ async fn main() -> Result<()> {
             // stays available as `models` / `info`.
             println!("NAME\tID\tSIZE\tMODIFIED");
             for e in registry::scan(&registry::default_root()) {
-                let id: String = e.digest.chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+                let id: String = e
+                    .digest
+                    .chars()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 println!(
                     "{}\t{}\t{}\t{}",
                     e.id,
@@ -710,13 +757,25 @@ async fn main() -> Result<()> {
             for e in entries {
                 println!(
                     "{}  {}  {} experts (top-{})  ctx {}  {:.1} GiB{}",
-                    e.id, e.arch, e.experts, e.experts_used, e.context,
+                    e.id,
+                    e.arch,
+                    e.experts,
+                    e.experts_used,
+                    e.context,
                     e.file_bytes as f64 / 1073741824.0,
                     if e.is_moe { "  [MoE]" } else { "" }
                 );
             }
         }
-        Commands::Show { model, model_flag, modelfile, template, license, parameters, full } => {
+        Commands::Show {
+            model,
+            model_flag,
+            modelfile,
+            template,
+            license,
+            parameters,
+            full,
+        } => {
             let name = either(model, model_flag, "model")?;
             let root = registry::default_root();
             let entries = registry::scan(&root);
@@ -748,7 +807,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 if !overrides["license"].is_null() {
-                    println!("{}", serde_json::to_string_pretty(&overrides["license"]).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&overrides["license"]).unwrap_or_default()
+                    );
                 }
             } else if parameters {
                 println!("{}", body["parameters"].as_str().unwrap_or(""));
@@ -758,16 +820,29 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&body)?);
             }
         }
-        Commands::Create { name, file, from, system, template } => {
+        Commands::Create {
+            name,
+            file,
+            from,
+            system,
+            template,
+        } => {
             let name = name.context("model name is required: strata create <name> -f Modelfile")?;
             let parsed = if let Some(path) = file {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {path}"))?;
+                let text =
+                    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 modelfile::Modelfile::parse(&text)?
             } else if let Some(from) = from {
-                let mut m = modelfile::Modelfile { from, ..Default::default() };
-                if let Some(v) = system { m.system = Some(v); }
-                if let Some(v) = template { m.template = Some(v); }
+                let mut m = modelfile::Modelfile {
+                    from,
+                    ..Default::default()
+                };
+                if let Some(v) = system {
+                    m.system = Some(v);
+                }
+                if let Some(v) = template {
+                    m.template = Some(v);
+                }
                 m
             } else {
                 bail!("create needs -f <Modelfile> or --from <model>");
@@ -775,32 +850,55 @@ async fn main() -> Result<()> {
             registry::create_from_modelfile(&registry::default_root(), &name, &parsed)?;
             println!("created {name}");
         }
-        Commands::Run { model, prompt, host: run_host, format, keepalive, think, image } => {
+        Commands::Run {
+            model,
+            prompt,
+            host: run_host,
+            format,
+            keepalive,
+            think,
+            image,
+        } => {
             let model = model.unwrap_or_default();
             let model = if model.is_empty() {
                 registry::scan(&registry::default_root())
                     .first()
                     .map(|e| e.id.clone())
                     .context("no models installed; run `strata pull --model <name>` first")?
-            } else { model };
+            } else {
+                model
+            };
             run::run(run::RunArgs {
                 host: run_host.unwrap_or(host),
                 model,
-                prompt: if prompt.is_empty() { None } else { Some(prompt) },
+                prompt: if prompt.is_empty() {
+                    None
+                } else {
+                    Some(prompt)
+                },
                 format,
                 keepalive,
                 image,
                 think,
                 verbose,
-            }).await?
+            })
+            .await?
         }
-        Commands::Stop { model, model_flag, host: stop_host } => {
+        Commands::Stop {
+            model,
+            model_flag,
+            host: stop_host,
+        } => {
             let name = either(model, model_flag, "model")?;
             let client = reqwest::Client::new();
             let base = stop_host.unwrap_or(host);
             let current: Value = client
                 .get(format!("{}/api/models/current", base.trim_end_matches('/')))
-                .send().await?.json().await.unwrap_or(json!({}));
+                .send()
+                .await?
+                .json()
+                .await
+                .unwrap_or(json!({}));
             let running = current.get("model").and_then(|v| v.as_str()).unwrap_or("");
             if running != name {
                 println!("{name} is not running (resident: {running})");
@@ -808,14 +906,19 @@ async fn main() -> Result<()> {
             }
             let resp = client
                 .post(format!("{}/api/models/unload", base.trim_end_matches('/')))
-                .send().await?;
+                .send()
+                .await?;
             if resp.status().is_success() {
                 println!("stopped {name}");
             } else {
                 bail!("could not stop {name}: {}", resp.text().await?);
             }
         }
-        Commands::Pull { model, model_flag, dry_run } => {
+        Commands::Pull {
+            model,
+            model_flag,
+            dry_run,
+        } => {
             let name = either(model, model_flag, "model")?;
             if dry_run {
                 let root = registry::default_root();
@@ -830,11 +933,21 @@ async fn main() -> Result<()> {
                 registry::tag(&registry::default_root(), &name, stored)?;
             }
         }
-        Commands::Push { model, registry: reg, token, insecure } => {
+        Commands::Push {
+            model,
+            registry: reg,
+            token,
+            insecure,
+        } => {
             let name = model.context("model name is required: strata push <model>")?;
             push::push(&name, reg.as_deref(), token.as_deref(), insecure).await?
         }
-        Commands::Signin { token, registry, device, client_id } => {
+        Commands::Signin {
+            token,
+            registry,
+            device,
+            client_id,
+        } => {
             if device {
                 auth::signin_device(&client_id).await?;
             } else {
@@ -842,19 +955,27 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Signout => auth::signout()?,
-        Commands::Ps { host: ps_host, json } => {
+        Commands::Ps {
+            host: ps_host,
+            json,
+        } => {
             let base = ps_host.unwrap_or(host);
             let client = reqwest::Client::new();
             let resp = client
                 .get(format!("{}/api/ps", base.trim_end_matches('/')))
-                .send().await
+                .send()
+                .await
                 .context("cannot reach Strata; is `strata serve` running?")?;
             let body: Value = resp.json().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&body)?);
             } else {
                 println!("NAME\tID\tSIZE\tPROCESSOR\tCONTEXT\tUNTIL");
-                for m in body.get("models").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+                for m in body
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&vec![])
+                {
                     let id = m
                         .get("digest")
                         .and_then(|v| v.as_str())
@@ -866,23 +987,37 @@ async fn main() -> Result<()> {
                         .get("expires_at")
                         .and_then(|v| v.as_str())
                         .unwrap_or("never");
-                    println!("{}\t{}\t{}\tGPU\t{}\t{}",
+                    println!(
+                        "{}\t{}\t{}\tGPU\t{}\t{}",
                         m.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                         id,
                         m.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-                        m.get("details").and_then(|d| d.get("context_length"))
-                            .and_then(|v| v.as_u64()).unwrap_or(0),
-                        until);
+                        m.get("details")
+                            .and_then(|d| d.get("context_length"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        until
+                    );
                 }
             }
         }
-        Commands::Cp { source, destination, from, to } => {
+        Commands::Cp {
+            source,
+            destination,
+            from,
+            to,
+        } => {
             let source = either(source, from, "source")?;
             let destination = either(destination, to, "destination")?;
             registry::copy(&registry::default_root(), &source, &destination)?;
             println!("copied {source} -> {destination}");
         }
-        Commands::Rm { model, model_flag, purge, keep_blobs } => {
+        Commands::Rm {
+            model,
+            model_flag,
+            purge,
+            keep_blobs,
+        } => {
             let name = either(model, model_flag, "model")?;
             registry::remove(&registry::default_root(), &name)?;
             println!("removed {name}");
@@ -896,8 +1031,16 @@ async fn main() -> Result<()> {
         Commands::Convert { safetensors, out } => convert::convert(&safetensors, &out)?,
         Commands::Export { model, out } => tools::export_bundle(&model, &out)?,
         Commands::Import { file } => tools::import_bundle(&file)?,
-        Commands::Quantize { input, output, kind } => tools::quantize(&input, &output, &kind)?,
-        Commands::Split { input, output, parts } => tools::split(&input, parts, &output)?,
+        Commands::Quantize {
+            input,
+            output,
+            kind,
+        } => tools::quantize(&input, &output, &kind)?,
+        Commands::Split {
+            input,
+            output,
+            parts,
+        } => tools::split(&input, parts, &output)?,
         Commands::Merge { input, output } => tools::merge(&input, &output)?,
         Commands::Gc { purge } => {
             let stale = blob::unreferenced(&registry::default_root());
@@ -910,11 +1053,27 @@ async fn main() -> Result<()> {
                         std::fs::remove_file(path)?;
                     }
                 }
-                println!("{} blob(s){}", stale.len(), if purge { " purged" } else { " (use --purge to delete)" });
+                println!(
+                    "{} blob(s){}",
+                    stale.len(),
+                    if purge {
+                        " purged"
+                    } else {
+                        " (use --purge to delete)"
+                    }
+                );
             }
         }
-        Commands::Launch { app, model, host: launch_host, args } => {
-            let base = launch_host.unwrap_or(host).trim_end_matches('/').to_string();
+        Commands::Launch {
+            app,
+            model,
+            host: launch_host,
+            args,
+        } => {
+            let base = launch_host
+                .unwrap_or(host)
+                .trim_end_matches('/')
+                .to_string();
             let url = format!("{base}/");
             match app.as_deref().unwrap_or("console") {
                 "console" | "web" | "ui" | "" => open_url(&url),
@@ -932,11 +1091,18 @@ async fn main() -> Result<()> {
                         command = format!("set STRATA_MODEL={chosen}&&{command}");
                     }
                     let status = if cfg!(windows) {
-                        std::process::Command::new("cmd").args(["/C", &command]).status()?
+                        std::process::Command::new("cmd")
+                            .args(["/C", &command])
+                            .status()?
                     } else {
-                        std::process::Command::new("sh").arg("-c").arg(&command).status()?
+                        std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&command)
+                            .status()?
                     };
-                    if !status.success() { bail!("terminal exited with {status}") }
+                    if !status.success() {
+                        bail!("terminal exited with {status}")
+                    }
                 }
                 other => {
                     let key = env_api_key().unwrap_or_else(|| "local".into());
@@ -959,11 +1125,18 @@ async fn main() -> Result<()> {
                     agent_args.extend(args);
                     println!("launching {program} against {base}");
                     let status = run_agent(program, &envs, &agent_args)?;
-                    if !status.success() { bail!("agent exited with {status}") }
+                    if !status.success() {
+                        bail!("agent exited with {status}")
+                    }
                 }
             }
         }
-        Commands::Switch { url, model, model_pos, api_key } => {
+        Commands::Switch {
+            url,
+            model,
+            model_pos,
+            api_key,
+        } => {
             let name = either(model_pos, model, "model")?;
             let api_key = api_key.or_else(env_api_key);
             registry::switch(&url, &name, api_key.as_deref()).await?
@@ -980,24 +1153,66 @@ async fn main() -> Result<()> {
             let _ = tok.vocab_size();
         }
         Commands::Inspect { path, all_layers } => {
-            if all_layers { gguf::inspect_all(&path)? } else { gguf::inspect(&path)? }
+            if all_layers {
+                gguf::inspect_all(&path)?
+            } else {
+                gguf::inspect(&path)?
+            }
         }
-        Commands::Dequant { path, tensor, count } => {
+        Commands::Dequant {
+            path,
+            tensor,
+            count,
+        } => {
             let values = dequant::preview(&path, &tensor, count)?;
-            println!("{tensor}: {} values decoded with Strata's reference decoder", values.len());
+            println!(
+                "{tensor}: {} values decoded with Strata's reference decoder",
+                values.len()
+            );
             println!("{values:?}");
         }
-        Commands::Plan { model, ctx, vram, ram } => {
+        Commands::Plan {
+            model,
+            ctx,
+            vram,
+            ram,
+        } => {
             let vram = vram.unwrap_or_else(rocm::vram_total_gb);
             placement::report(&model, ctx, vram, ram)?
         }
-        Commands::Tune { model, ctx, kv_type, save } => {
-            tune::run(&model, ctx, kv_type, save).await?
+        Commands::Tune {
+            model,
+            ctx,
+            kv_type,
+            save,
+        } => tune::run(&model, ctx, kv_type, save).await?,
+        Commands::Bench {
+            url,
+            model,
+            prompt_tokens,
+            tokenizer,
+            output_tokens,
+            json,
+            compare,
+        } => {
+            bench::run(bench::BenchArgs {
+                url,
+                model,
+                prompt_tokens,
+                tokenizer,
+                output_tokens,
+                json,
+                compare,
+            })
+            .await?
         }
-        Commands::Bench { url, model, prompt_tokens, output_tokens, json, compare } => {
-            bench::run(bench::BenchArgs { url, model, prompt_tokens, output_tokens, json, compare }).await?
-        }
-        Commands::Service { install, uninstall, listen, model, ctx } => {
+        Commands::Service {
+            install,
+            uninstall,
+            listen,
+            model,
+            ctx,
+        } => {
             if uninstall {
                 daemon::service_uninstall()?;
             } else if install {
@@ -1013,7 +1228,13 @@ async fn main() -> Result<()> {
                 println!("use --install or --uninstall");
             }
         }
-        Commands::ServiceWindows { install, uninstall, listen, model, ctx } => {
+        Commands::ServiceWindows {
+            install,
+            uninstall,
+            listen,
+            model,
+            ctx,
+        } => {
             if uninstall {
                 winservice::uninstall()?;
             } else if install {
@@ -1069,7 +1290,11 @@ async fn main() -> Result<()> {
             let key = std::path::Path::new(&dir).join("key.pem");
             std::fs::write(&cert, certified.cert.pem())?;
             std::fs::write(&key, certified.key_pair.serialize_pem())?;
-            println!("wrote {} and {}\nSet STRATA_TLS_CERT/STRATA_TLS_KEY to serve HTTPS.", cert.display(), key.display());
+            println!(
+                "wrote {} and {}\nSet STRATA_TLS_CERT/STRATA_TLS_KEY to serve HTTPS.",
+                cert.display(),
+                key.display()
+            );
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
@@ -1108,8 +1333,22 @@ async fn main() -> Result<()> {
         Commands::Update { stash } => updater::run(stash)?,
         Commands::Mcp => mcp::run().await?,
         Commands::Serve {
-            listen, port, model, ctx, cpu_moe, upstream, no_compact, kv_type, api_key,
-            draft, spec, mmproj, devices, tensor_split, backend, embeddings,
+            listen,
+            port,
+            model,
+            ctx,
+            cpu_moe,
+            upstream,
+            no_compact,
+            kv_type,
+            api_key,
+            draft,
+            spec,
+            mmproj,
+            devices,
+            tensor_split,
+            backend,
+            embeddings,
         } => {
             let listen = match port {
                 Some(p) => format!(
@@ -1120,12 +1359,23 @@ async fn main() -> Result<()> {
                 None => listen,
             };
             server::serve(server::ServeOptions {
-                listen, model, ctx, cpu_moe, upstream,
+                listen,
+                model,
+                ctx,
+                cpu_moe,
+                upstream,
                 compact: !no_compact,
                 kv_type: kv_type.or_else(env_kv_type),
                 api_key: api_key.or_else(env_api_key),
-                draft, spec, mmproj, devices, tensor_split, backend, embeddings,
-            }).await?
+                draft,
+                spec,
+                mmproj,
+                devices,
+                tensor_split,
+                backend,
+                embeddings,
+            })
+            .await?
         }
     }
     Ok(())

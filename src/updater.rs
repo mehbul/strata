@@ -44,7 +44,10 @@ pub fn run(stash: bool) -> Result<()> {
         }
         let out = git(&["stash", "push", "-u", "strata update auto-stash"])?;
         if !out.status.success() {
-            bail!("git stash failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "git stash failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         println!("Auto-stashed local changes.");
     }
@@ -52,12 +55,17 @@ pub fn run(stash: bool) -> Result<()> {
     println!("Fetching updates...");
     let out = git(&["pull", "--ff-only"])?;
     if !out.status.success() {
-        bail!("git pull failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git pull failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     println!("{}", String::from_utf8_lossy(&out.stdout).trim());
 
     println!("Rebuilding the engine...");
-    let out = Command::new("cargo").args(["build", "--release"]).status()?;
+    let out = Command::new("cargo")
+        .args(["build", "--release"])
+        .status()?;
     if !out.success() {
         bail!("cargo build --release failed");
     }

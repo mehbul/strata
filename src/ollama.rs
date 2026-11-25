@@ -209,7 +209,11 @@ pub fn generate_to_openai(req: &Value) -> anyhow::Result<Value> {
             }
         }
     }
-    let mut prompt = req.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut prompt = req
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     // Ollama's `suffix` is the text after the generated span. A chat compute
     // process has no insertion point, so append it as a prompt hint rather than
     // dropping the field.
@@ -497,10 +501,7 @@ pub fn show_body_verbose(e: &crate::registry::ModelEntry, verbose: bool) -> Valu
             (k.clone(), value)
         })
         .collect();
-    info.insert(
-        "general.parameter_count".into(),
-        json!(e.parameter_count),
-    );
+    info.insert("general.parameter_count".into(), json!(e.parameter_count));
     if verbose {
         if let Ok(g) = crate::gguf::Gguf::open(&e.path) {
             for key in [

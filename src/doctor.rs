@@ -8,7 +8,11 @@
 use anyhow::Result;
 
 fn mark(ok: bool) -> &'static str {
-    if ok { "OK  " } else { "FAIL" }
+    if ok {
+        "OK  "
+    } else {
+        "FAIL"
+    }
 }
 
 pub async fn run(host: &str) -> Result<()> {
@@ -24,7 +28,9 @@ pub async fn run(host: &str) -> Result<()> {
             if path.is_dir() {
                 for entry in walk(path) {
                     if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
-                        if t > newest { newest = t; }
+                        if t > newest {
+                            newest = t;
+                        }
                     }
                 }
             }
@@ -39,7 +45,11 @@ pub async fn run(host: &str) -> Result<()> {
     println!(
         "{} binary   {}",
         mark(!stale),
-        if stale { "source is newer than the binary — cargo build --release" } else { "up to date" }
+        if stale {
+            "source is newer than the binary — cargo build --release"
+        } else {
+            "up to date"
+        }
     );
 
     // Runtime and GPU. A missing ROCm DLL produces an empty device list with
@@ -48,7 +58,10 @@ pub async fn run(host: &str) -> Result<()> {
     let has_runtime = runtime.exists();
     println!("{} runtime  {}", mark(has_runtime), runtime.display());
     if has_runtime {
-        match std::process::Command::new(&runtime).arg("--list-devices").output() {
+        match std::process::Command::new(&runtime)
+            .arg("--list-devices")
+            .output()
+        {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let devices: Vec<&str> = text
@@ -82,7 +95,11 @@ pub async fn run(host: &str) -> Result<()> {
     println!(
         "{} console  {}",
         mark(console.exists()),
-        if console.exists() { "built" } else { "missing — npm run build (in web/)" }
+        if console.exists() {
+            "built"
+        } else {
+            "missing — npm run build (in web/)"
+        }
     );
 
     // Registry token, only relevant for push.
@@ -90,16 +107,29 @@ pub async fn run(host: &str) -> Result<()> {
     println!(
         "{} registry {}",
         if token.is_some() { "OK  " } else { "--  " },
-        if token.is_some() { "token available" } else { "no token (pull and local use need none)" }
+        if token.is_some() {
+            "token available"
+        } else {
+            "no token (pull and local use need none)"
+        }
     );
 
     // Running server, if any.
     let client = reqwest::Client::new();
     let url = format!("{}/api/version", host.trim_end_matches('/'));
-    match client.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            println!("{} server   {} at {host}", mark(true), body["version"].as_str().unwrap_or("?"));
+            println!(
+                "{} server   {} at {host}",
+                mark(true),
+                body["version"].as_str().unwrap_or("?")
+            );
         }
         _ => println!("-- server   not reachable at {host} (fine unless you need the API)"),
     }
@@ -108,7 +138,9 @@ pub async fn run(host: &str) -> Result<()> {
 
 fn walk(dir: &std::path::Path) -> Vec<std::fs::DirEntry> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in rd.flatten() {
         if entry.path().is_dir() {
             out.extend(walk(&entry.path()));

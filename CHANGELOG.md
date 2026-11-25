@@ -16,6 +16,12 @@ versioning](https://semver.org/): 0.x releases may break between minors.
 - Deterministic Ollama reverse-engineering dossier in `docs/OLLAMA-RE.md`.
 - Web console: model management and per-request think/format/keep-alive/image
   controls.
+- Fixed installer GPU detection: the ROCm runtime is provisioned with the
+  `hipblas`/`rocblas` support DLLs it imports, and setup fails loudly instead of
+  silently falling back to CPU.
+- `strata bench` sizes its prompt with the model's own tokenizer and reports the
+  requested and observed token counts.
+- Clippy is clean with `-D warnings` on all targets.
 
 ## [0.1.0] — 2026-11-17
 

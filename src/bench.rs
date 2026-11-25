@@ -18,9 +18,12 @@ pub struct BenchArgs {
     /// Model name to send (defaults to whatever the server reports first)
     #[arg(long)]
     pub model: Option<String>,
-    /// Approximate prompt size in tokens
+    /// Prompt size in tokens, measured with the model's own tokenizer
     #[arg(long, default_value_t = 2048)]
     pub prompt_tokens: usize,
+    /// GGUF whose tokenizer should size the prompt (auto-detected from the model)
+    #[arg(long)]
+    pub tokenizer: Option<String>,
     /// Tokens to generate
     #[arg(long, default_value_t = 256)]
     pub output_tokens: usize,
@@ -30,6 +33,18 @@ pub struct BenchArgs {
     /// Compare the new run with a previous JSON result
     #[arg(long)]
     pub compare: Option<String>,
+}
+
+/// Last-resort sizing when no GGUF tokenizer is available.
+fn estimate_prompt(tokens: usize) -> String {
+    const BASE: &str = "The quick brown fox jumps over the lazy dog. ";
+    let target = tokens.saturating_mul(4);
+    let mut prompt = String::with_capacity(target);
+    while prompt.len() < target {
+        prompt.push_str(BASE);
+    }
+    prompt.truncate(target);
+    prompt
 }
 
 pub async fn run(args: BenchArgs) -> Result<()> {
@@ -55,16 +70,45 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         }
     };
 
-    // Build a prompt of roughly the requested size. Four chars per token is a
-    // guess, same caveat PolyStrata prints.
-    let words_per_token = 4usize;
-    let target_chars = args.prompt_tokens * words_per_token;
-    let base = "The quick brown fox jumps over the lazy dog. ";
-    let mut prompt = String::new();
-    while prompt.len() < target_chars {
-        prompt.push_str(base);
-    }
-    prompt.truncate(target_chars);
+    // Size the prompt with the model's tokenizer rather than by characters.
+    // A character estimate lands anywhere near the requested size on a large
+    // vocabulary or a non-English prompt, which makes a benchmark misleading.
+    let (prompt, sized) = match args.tokenizer.clone().or_else(|| {
+        crate::placement::resolve_path(&model).map(|p| p.to_string_lossy().into_owned())
+    }) {
+        Some(path) => match crate::tokenizer::Tokenizer::from_gguf(&path) {
+            Ok(tok) => {
+                let base = "The quick brown fox jumps over the lazy dog. ";
+                let mut text = String::with_capacity(args.prompt_tokens * 8);
+                while text.len() < args.prompt_tokens * 8 {
+                    text.push_str(base);
+                }
+                match tok.encode(&text) {
+                    Ok(ids) => {
+                        let n = ids.len().min(args.prompt_tokens);
+                        match tok.decode(&ids[..n]) {
+                            Ok(decoded) => (decoded, Some(n)),
+                            Err(e) => {
+                                eprintln!(
+                                    "tokenizer decode failed ({e}); using character estimate"
+                                );
+                                (estimate_prompt(args.prompt_tokens), None)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("tokenizer encode failed ({e}); using character estimate");
+                        (estimate_prompt(args.prompt_tokens), None)
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("cannot open tokenizer {path} ({e}); using character estimate");
+                (estimate_prompt(args.prompt_tokens), None)
+            }
+        },
+        None => (estimate_prompt(args.prompt_tokens), None),
+    };
 
     let body = serde_json::json!({
         "model": model,
@@ -78,11 +122,18 @@ pub async fn run(args: BenchArgs) -> Result<()> {
     println!("strata bench");
     println!("  url           {}", args.url);
     println!("  model         {}", model);
-    println!(
-        "  prompt_tokens ~{} (chars {})",
-        args.prompt_tokens,
-        prompt.len()
-    );
+    match sized {
+        Some(n) => println!(
+            "  prompt_tokens {} (model tokenizer, chars {})",
+            n,
+            prompt.len()
+        ),
+        None => println!(
+            "  prompt_tokens ~{} (character estimate, chars {})",
+            args.prompt_tokens,
+            prompt.len()
+        ),
+    }
     println!("  output_tokens {}", args.output_tokens);
     println!();
 
@@ -169,7 +220,10 @@ pub async fn run(args: BenchArgs) -> Result<()> {
     };
 
     println!("Results:");
-    println!("  prompt_tokens      {}", prompt_tokens);
+    println!(
+        "  prompt_tokens      {} (requested {})",
+        prompt_tokens, args.prompt_tokens
+    );
     println!("  completion_tokens {}", completion_tokens);
     println!("  TTFT              {} ms", ttft);
     println!("  prefill           {:.1} tok/s", prefill_tps);
@@ -202,10 +256,26 @@ pub async fn run(args: BenchArgs) -> Result<()> {
                 "decode_tps" => decode_tps,
                 _ => total_ms as f64,
             };
-            let delta = if before > 0.0 { (now - before) / before * 100.0 } else { 0.0 };
+            let delta = if before > 0.0 {
+                (now - before) / before * 100.0
+            } else {
+                0.0
+            };
             println!("  {:<14} {:.1} -> {:.1} ({:+.1}%)", key, before, now, delta);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn character_fallback_hits_the_requested_size() {
+        for tokens in [0, 1, 100, 2048] {
+            assert_eq!(estimate_prompt(tokens).len(), tokens.saturating_mul(4));
+        }
+    }
 }

@@ -111,12 +111,15 @@ pub fn preview(path: &str, tensor: &str, count: usize) -> Result<Vec<f32>> {
     let info = gguf
         .tensor(tensor)
         .ok_or_else(|| anyhow::anyhow!("no tensor named {tensor}"))?;
-    let (block_bytes, elements, decode): (usize, usize, fn(&[u8]) -> Result<Vec<f32>>) =
-        match info.kind {
-            crate::gguf::GgmlType::Q4K => (Q4_K_BYTES, QK_K, dequant_q4_k),
-            crate::gguf::GgmlType::Q6K => (Q6_K_BYTES, QK_K, dequant_q6_k),
-            _ => bail!("only Q4_K and Q6_K are dequantised; tensor is {}", info.kind.name()),
-        };
+    type Decoder = fn(&[u8]) -> Result<Vec<f32>>;
+    let (block_bytes, elements, decode): (usize, usize, Decoder) = match info.kind {
+        crate::gguf::GgmlType::Q4K => (Q4_K_BYTES, QK_K, dequant_q4_k),
+        crate::gguf::GgmlType::Q6K => (Q6_K_BYTES, QK_K, dequant_q6_k),
+        _ => bail!(
+            "only Q4_K and Q6_K are dequantised; tensor is {}",
+            info.kind.name()
+        ),
+    };
     let blocks = count.div_ceil(elements);
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(gguf.data_offset + info.offset))?;

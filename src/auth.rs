@@ -40,7 +40,11 @@ pub fn registry_url() -> String {
         .or_else(|_| std::env::var("OLLAMA_REGISTRY"))
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::fs::read_to_string(registry_path()).ok().map(|s| s.trim().to_string()))
+        .or_else(|| {
+            std::fs::read_to_string(registry_path())
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://registry.ollama.ai".into())
 }
@@ -133,7 +137,10 @@ pub fn signin(token: Option<&str>, registry: Option<&str>) -> Result<()> {
     let value = match token {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => {
-            println!("Paste a registry token (it is stored in {}):", token_path().display());
+            println!(
+                "Paste a registry token (it is stored in {}):",
+                token_path().display()
+            );
             let mut line = String::new();
             io::stdin()
                 .lock()

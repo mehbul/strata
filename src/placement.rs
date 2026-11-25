@@ -8,14 +8,6 @@ use std::path::{Path, PathBuf};
 
 use crate::gguf::{Gguf, ModelFacts};
 
-/// Where a weight can live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
-    Vram,
-    Ram,
-    Disk,
-}
-
 #[derive(Debug, Clone)]
 pub struct Placement {
     pub facts: ModelFacts,
@@ -52,19 +44,16 @@ pub fn resolve_path(model: &str) -> Option<PathBuf> {
         return Some(direct.to_path_buf());
     }
     let safe = model.replace([':', '/', '\\'], "_");
-    for candidate in [
+    [
         PathBuf::from("rocm/models").join(&safe).join("model.gguf"),
         PathBuf::from("rocm/models").join(model).join("model.gguf"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("rocm/models")
             .join(&safe)
             .join("model.gguf"),
-    ] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 /// How the routed experts divide across the three tiers.
@@ -142,18 +131,17 @@ impl Placement {
         let head_dim = gguf
             .key_u64("attention.head_dim")
             .or_else(|| gguf.key_u64("rope.dimension_count"))
-            .unwrap_or_else(|| {
-                if facts.heads > 0 {
-                    (facts.embedding / facts.heads) as u64
-                } else {
-                    0
-                }
-            });
-        let kv_heads = if facts.kv_heads > 0 { facts.kv_heads } else { facts.heads };
+            .unwrap_or_else(|| facts.embedding.checked_div(facts.heads).unwrap_or(0) as u64);
+        let kv_heads = if facts.kv_heads > 0 {
+            facts.kv_heads
+        } else {
+            facts.heads
+        };
         let key_len = gguf.key_u64("attention.key_length").unwrap_or(head_dim);
         let value_len = gguf.key_u64("attention.value_length").unwrap_or(head_dim);
         // f16 cache: 2 bytes per element, K and V, per kv head, per layer.
-        let kv_bytes_per_token = attention_layers as u64 * kv_heads as u64 * (key_len + value_len) * 2;
+        let kv_bytes_per_token =
+            attention_layers as u64 * kv_heads as u64 * (key_len + value_len) * 2;
         let kv_bytes = kv_bytes_per_token * ctx as u64;
 
         // Dense weights and the KV cache are what must be resident to run at
@@ -205,11 +193,12 @@ impl Placement {
     /// stream the rest from host memory. Returning 0 when the whole file does
     /// not fit would be wrong — that is exactly when partial offload matters.
     pub fn gpu_layers(&self) -> usize {
-        gpu_layers_for(self.total_weight_bytes, self.kv_bytes, self.facts.layers, self.vram_budget)
-    }
-
-    pub fn fits_without_disk(&self) -> bool {
-        self.disk_experts == 0
+        gpu_layers_for(
+            self.total_weight_bytes,
+            self.kv_bytes,
+            self.facts.layers,
+            self.vram_budget,
+        )
     }
 }
 
@@ -280,7 +269,10 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
             p.expert_bytes as f64 / p.expert_count as f64 / 1024.0 / 1024.0
         );
     } else {
-        println!("  routed        {:>8.2} GiB   (dense model — every layer is active)", gib(0));
+        println!(
+            "  routed        {:>8.2} GiB   (dense model — every layer is active)",
+            gib(0)
+        );
     }
     println!(
         "KV @ {:<7}    {:>8.2} GiB   ({} bytes/token)",
@@ -334,44 +326,6 @@ pub fn report(model: &str, ctx: usize, vram_gb: f32, ram_gb: f32) -> Result<()> 
     Ok(())
 }
 
-/// `strata list` — models actually present under rocm/models, read from their headers.
-pub fn list_local() -> Result<()> {
-    let root = Path::new("rocm/models");
-    if !root.is_dir() {
-        println!("No rocm/models directory yet.");
-        println!("`strata pull --model <name>` copies a model out of the Ollama blob store.");
-        return Ok(());
-    }
-    let mut found = 0;
-    for entry in std::fs::read_dir(root)? {
-        let dir = entry?.path();
-        let file = dir.join("model.gguf");
-        if !file.is_file() {
-            continue;
-        }
-        found += 1;
-        match Gguf::open(&file).and_then(|g| ModelFacts::read(&g).map(|f| (g, f))) {
-            Ok((g, f)) => {
-                println!(
-                    "{:<22} {:<12} {:>3} layers  {:>5} experts x top-{:<2} {:>7.2} GiB  ctx {}",
-                    dir.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
-                    f.arch,
-                    f.layers,
-                    f.experts,
-                    f.experts_used,
-                    gib(g.tensor_bytes()),
-                    f.context,
-                );
-            }
-            Err(e) => println!("{:<22} unreadable: {e}", dir.display()),
-        }
-    }
-    if found == 0 {
-        println!("rocm/models exists but holds no model.gguf files.");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,9 +336,9 @@ mod tests {
     fn a_dense_model_gets_partial_gpu_offload_instead_of_all_or_nothing() {
         // 14 GiB of weights, 1 GiB of KV, 16 GiB of VRAM: the old code returned
         // 0 layers because the model did not fit whole. Ollama keeps what fits.
-        let n = gpu_layers_for(14 * GIB, 1 * GIB, 28, 16 * GIB);
+        let n = gpu_layers_for(14 * GIB, GIB, 28, 16 * GIB);
         assert_eq!(n, 28);
-        let n = gpu_layers_for(20 * GIB, 1 * GIB, 28, 16 * GIB);
+        let n = gpu_layers_for(20 * GIB, GIB, 28, 16 * GIB);
         assert!(n > 0 && n < 28, "got {n}");
         assert_eq!(n, 21);
         // A cache that alone fills VRAM leaves nothing for weights.

@@ -88,8 +88,9 @@ impl Modelfile {
             match directive.to_ascii_uppercase().as_str() {
                 "FROM" => out.from = unquote(&rest),
                 "PARAMETER" => {
-                    let (k, v) = key_value(&rest)
-                        .ok_or_else(|| anyhow::anyhow!("PARAMETER needs a key and value: {rest}"))?;
+                    let (k, v) = key_value(&rest).ok_or_else(|| {
+                        anyhow::anyhow!("PARAMETER needs a key and value: {rest}")
+                    })?;
                     out.parameters.push((k, unquote(&v)));
                 }
                 "TEMPLATE" => {
@@ -158,12 +159,11 @@ impl Modelfile {
             out["license"] = json!(self.licenses);
         }
         if !self.messages.is_empty() {
-            out["messages"] = json!(
-                self.messages
-                    .iter()
-                    .map(|(role, content)| json!({ "role": role, "content": content }))
-                    .collect::<Vec<_>>()
-            );
+            out["messages"] = json!(self
+                .messages
+                .iter()
+                .map(|(role, content)| json!({ "role": role, "content": content }))
+                .collect::<Vec<_>>());
         }
         if !self.capabilities.is_empty() {
             out["capabilities"] = json!(self.capabilities);

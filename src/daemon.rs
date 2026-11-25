@@ -17,8 +17,12 @@ fn dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-fn pid_path() -> Result<std::path::PathBuf> { Ok(dir()?.join("daemon.pid")) }
-fn log_path() -> Result<std::path::PathBuf> { Ok(dir()?.join("daemon.log")) }
+fn pid_path() -> Result<std::path::PathBuf> {
+    Ok(dir()?.join("daemon.pid"))
+}
+fn log_path() -> Result<std::path::PathBuf> {
+    Ok(dir()?.join("daemon.log"))
+}
 
 fn read_pid() -> Option<u32> {
     std::fs::read_to_string(pid_path().ok()?)
@@ -80,9 +84,12 @@ pub async fn start(listen: &str, model: &str, ctx: usize) -> Result<()> {
     let child = Command::new(exe)
         .args([
             "serve",
-            "--model", model,
-            "--ctx", &ctx.to_string(),
-            "--listen", listen,
+            "--model",
+            model,
+            "--ctx",
+            &ctx.to_string(),
+            "--listen",
+            listen,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
@@ -90,7 +97,11 @@ pub async fn start(listen: &str, model: &str, ctx: usize) -> Result<()> {
         .spawn()
         .context("could not start the server")?;
     std::fs::write(pid_path()?, child.id().to_string())?;
-    println!("Starting Strata (PID {}) — log at {}", child.id(), log_path()?.display());
+    println!(
+        "Starting Strata (PID {}) — log at {}",
+        child.id(),
+        log_path()?.display()
+    );
 
     for _ in 0..120 {
         if healthy(listen).await {
@@ -98,11 +109,17 @@ pub async fn start(listen: &str, model: &str, ctx: usize) -> Result<()> {
             return Ok(());
         }
         if !alive(child.id()) {
-            bail!("server exited during startup; see {}", log_path()?.display());
+            bail!(
+                "server exited during startup; see {}",
+                log_path()?.display()
+            );
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    bail!("server did not become ready in 120s; see {}", log_path()?.display())
+    bail!(
+        "server did not become ready in 120s; see {}",
+        log_path()?.display()
+    )
 }
 
 pub fn stop(listen: &str) -> Result<()> {
@@ -121,7 +138,10 @@ pub fn stop(listen: &str) -> Result<()> {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output()?;
         if !out.status.success() {
-            bail!("taskkill failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "taskkill failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
     }
     #[cfg(not(windows))]
@@ -154,7 +174,10 @@ pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
     let exe = std::env::current_exe()?;
     let command = format!(
         "\"{}\" daemon start --listen {} --model {} --ctx {}",
-        exe.display(), listen, model, ctx
+        exe.display(),
+        listen,
+        model,
+        ctx
     );
     let out = Command::new("schtasks")
         .args([
@@ -162,19 +185,35 @@ pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
         ])
         .output()?;
     if !out.status.success() {
-        bail!("schtasks failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "schtasks failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let watch_command = format!(
         "\"{}\" daemon watch --listen {} --model {} --ctx {}",
-        exe.display(), listen, model, ctx
+        exe.display(),
+        listen,
+        model,
+        ctx
     );
     let watch = Command::new("schtasks")
         .args([
-            "/Create", "/TN", "Strata-Watch", "/TR", &watch_command, "/SC", "ONLOGON", "/F",
+            "/Create",
+            "/TN",
+            "Strata-Watch",
+            "/TR",
+            &watch_command,
+            "/SC",
+            "ONLOGON",
+            "/F",
         ])
         .output()?;
     if !watch.status.success() {
-        bail!("schtasks watchdog failed: {}", String::from_utf8_lossy(&watch.stderr).trim());
+        bail!(
+            "schtasks watchdog failed: {}",
+            String::from_utf8_lossy(&watch.stderr).trim()
+        );
     }
     println!("Installed logon tasks 'Strata' and 'Strata-Watch' for {model} on http://{listen}");
     Ok(())
@@ -182,9 +221,14 @@ pub fn service_install(listen: &str, model: &str, ctx: usize) -> Result<()> {
 
 pub fn service_uninstall() -> Result<()> {
     for name in ["Strata", "Strata-Watch"] {
-        let out = Command::new("schtasks").args(["/Delete", "/TN", name, "/F"]).output()?;
+        let out = Command::new("schtasks")
+            .args(["/Delete", "/TN", name, "/F"])
+            .output()?;
         if !out.status.success() {
-            println!("could not remove task {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            println!(
+                "could not remove task {name}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
     }
     println!("Removed logon tasks.");
@@ -195,13 +239,21 @@ pub async fn status(listen: &str) -> Result<()> {
     match read_pid() {
         Some(pid) => println!(
             "{} PID {pid}",
-            if alive(pid) { "running" } else { "stale PID file" }
+            if alive(pid) {
+                "running"
+            } else {
+                "stale PID file"
+            }
         ),
         None => println!("not started"),
     }
     println!(
         "server: {}",
-        if healthy(listen).await { "responding" } else { "not responding" }
+        if healthy(listen).await {
+            "responding"
+        } else {
+            "not responding"
+        }
     );
     println!("log: {}", log_path()?.display());
     Ok(())

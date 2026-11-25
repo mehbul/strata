@@ -4,7 +4,7 @@
 //! `registry.rs`. Everything here is parsed from the file on disk; nothing is
 //! assumed about the architecture.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -432,7 +432,8 @@ impl ModelFacts {
                 .key_u64("attention.head_count_kv")
                 .or_else(|| gguf.key_array_u64_first("attention.head_count_kv"))
                 .unwrap_or_else(|| {
-                    gguf.key_array_u64_first("attention.head_count").unwrap_or(0)
+                    gguf.key_array_u64_first("attention.head_count")
+                        .unwrap_or(0)
                 }) as usize,
             experts: gguf.key_u64("expert_count").unwrap_or(0) as usize,
             experts_used: gguf.key_u64("expert_used_count").unwrap_or(0) as usize,
@@ -649,10 +650,17 @@ pub fn inspect_all(path: &str) -> Result<()> {
     println!("=== {} — {} layers ===", facts.name, facts.layers);
     for layer in 0..facts.layers {
         let tensors = g.layer_tensors(layer);
-        if tensors.is_empty() { continue }
+        if tensors.is_empty() {
+            continue;
+        }
         println!("\n--- layer {layer} ({} tensors) ---", tensors.len());
         for t in tensors {
-            let dims = t.dims.iter().map(u64::to_string).collect::<Vec<_>>().join(" x ");
+            let dims = t
+                .dims
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(" x ");
             println!("  {:<40} {:<20} {}", t.name, dims, t.kind.name());
         }
     }
@@ -670,7 +678,10 @@ mod tests {
             "inkling2_loop.attention.head_count".into(),
             Value::Array(vec![Value::U32(24), Value::U32(24)]),
         );
-        metadata.insert("general.architecture".into(), Value::Str("inkling2_loop".into()));
+        metadata.insert(
+            "general.architecture".into(),
+            Value::Str("inkling2_loop".into()),
+        );
         let gguf = Gguf {
             version: 3,
             metadata,

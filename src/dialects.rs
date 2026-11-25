@@ -14,11 +14,7 @@ fn text_of(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Array(items) => items
             .iter()
-            .filter_map(|i| {
-                i.get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| i.as_str())
-            })
+            .filter_map(|i| i.get("text").and_then(Value::as_str).or_else(|| i.as_str()))
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
@@ -49,7 +45,10 @@ pub fn completions_to_chat(req: &Value) -> Result<Value> {
     messages.push(json!({ "role": "user", "content": prompt }));
 
     let mut out = Map::new();
-    out.insert("model".into(), req.get("model").cloned().unwrap_or(json!("")));
+    out.insert(
+        "model".into(),
+        req.get("model").cloned().unwrap_or(json!("")),
+    );
     out.insert("messages".into(), json!(messages));
     out.insert(
         "stream".into(),
@@ -110,7 +109,10 @@ pub fn responses_to_chat(req: &Value) -> Result<Value> {
         _ => bail!("input must be a string or an array"),
     }
     let mut out = Map::new();
-    out.insert("model".into(), req.get("model").cloned().unwrap_or(json!("")));
+    out.insert(
+        "model".into(),
+        req.get("model").cloned().unwrap_or(json!("")),
+    );
     out.insert("messages".into(), json!(messages));
     out.insert(
         "stream".into(),
@@ -177,7 +179,10 @@ pub fn chat_to_completions(body: &Value, model: &str, id: &str, created: u64) ->
 /// A chat completion answer → a Responses API object.
 pub fn chat_to_response(body: &Value, model: &str, id: &str, created: u64) -> Value {
     let (text, _finish, usage) = choice(body);
-    let input = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let output = usage
         .get("completion_tokens")
         .and_then(Value::as_u64)
@@ -220,7 +225,9 @@ pub fn valid_structured(text: &str, format: &Value) -> bool {
         // A schema we cannot compile is not evidence that the answer is bad.
         Err(_) => {
             if let Some(Value::Array(required)) = schema.get("required") {
-                required.iter().all(|k| k.as_str().map_or(false, |key| value.get(key).is_some()))
+                required
+                    .iter()
+                    .all(|k| k.as_str().is_some_and(|key| value.get(key).is_some()))
             } else {
                 true
             }

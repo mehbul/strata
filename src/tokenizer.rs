@@ -177,8 +177,11 @@ impl Tokenizer {
         loop {
             let mut best: Option<(usize, usize)> = None;
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&rank) = self.merges.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
-                    if best.map_or(true, |(r, _)| rank < r) {
+                if let Some(&rank) = self
+                    .merges
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                {
+                    if best.is_none_or(|(r, _)| rank < r) {
                         best = Some((rank, i));
                     }
                 }
@@ -256,7 +259,9 @@ mod tests {
     fn a_small_vocab_performs_bpe_merges_by_rank() {
         let mut t = Tokenizer {
             tokens: vec!["a".into(), "b".into(), "ab".into()],
-            lookup: [("a".into(), 0), ("b".into(), 1), ("ab".into(), 2)].into_iter().collect(),
+            lookup: [("a".into(), 0), ("b".into(), 1), ("ab".into(), 2)]
+                .into_iter()
+                .collect(),
             merges: [(("a".into(), "b".into()), 0)].into_iter().collect(),
             byte_map: bytes_to_unicode(),
             bos: 0,

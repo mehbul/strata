@@ -105,6 +105,12 @@ If it prints nothing, a backend library is missing. llama.cpp reports this as an
 empty device list with nothing in its log, so test with `--list-devices` rather
 than assuming the GPU is being used.
 
+The ROCm zip ships `ggml-hip.dll` but not all the libraries it imports: it also
+needs `hipblas.dll`, `rocblas.dll`, `libhipblaslt.dll` and the MSVC runtime DLLs
+next to `llama-server.exe`. `install.ps1` copies these from a local Ollama ROCm
+folder or an AMD HIP SDK, and refuses to finish when no GPU is listed. For a
+manual setup, point `STRATA_ROCM_LIBS` at a directory containing them.
+
 ### 3. Get a model
 
 Any MoE `.gguf` at `rocm/models/<name>/model.gguf`, or fetch one:

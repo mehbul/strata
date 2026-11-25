@@ -149,8 +149,7 @@ fn parse_devices(text: &str) -> Vec<Device> {
         let name = rest[..open].trim().to_string();
         let inside = &rest[open + 1..open + close];
         let mut sizes = inside.split(',').filter_map(|part| {
-            part.trim()
-                .split_whitespace()
+            part.split_whitespace()
                 .next()
                 .and_then(|n| n.parse::<u64>().ok())
         });

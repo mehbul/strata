@@ -7,6 +7,9 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use winit::event_loop::EventLoop;
 
+// `run_app` requires rewriting the tray callback to an Application handler;
+// the deprecated call is stable on the winit version this release pins.
+#[allow(deprecated)]
 pub async fn run(listen: String, model: String, ctx: usize) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let start = MenuItem::new("Start", true, None);
@@ -34,12 +37,16 @@ pub async fn run(listen: String, model: String, ctx: usize) -> Result<()> {
                 let l = listen_for_menu.clone();
                 let m = model_for_menu.clone();
                 let c = ctx;
-                tokio::spawn(async move { crate::daemon::start(&l, &m, c).await.ok(); });
+                tokio::spawn(async move {
+                    crate::daemon::start(&l, &m, c).await.ok();
+                });
             } else if event.id == stop.id() {
                 crate::daemon::stop(&listen_for_menu).ok();
             } else if event.id == status.id() {
                 let l = listen_for_menu.clone();
-                tokio::spawn(async move { crate::daemon::status(&l).await.ok(); });
+                tokio::spawn(async move {
+                    crate::daemon::status(&l).await.ok();
+                });
             } else if event.id == quit.id() {
                 std::process::exit(0);
             }

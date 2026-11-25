@@ -105,10 +105,8 @@ pub async fn push(
 
     println!("Pushing {name} to {registry}/{repo}:{tag}");
     let config = json!({});
-    let config_path = std::env::temp_dir().join(format!(
-        "strata-config-{}.json",
-        std::process::id()
-    ));
+    let config_path =
+        std::env::temp_dir().join(format!("strata-config-{}.json", std::process::id()));
     std::fs::write(&config_path, config.to_string())?;
     let config_digest = upload_blob(&client, &registry, &repo, &token, &config_path).await?;
     std::fs::remove_file(&config_path).ok();
@@ -130,10 +128,11 @@ pub async fn push(
                     _ => None,
                 };
                 if let Some(content) = value {
-                    if content.is_empty() { continue }
-                    let tmp = std::env::temp_dir().join(format!(
-                        "strata-{}-{key}.json", std::process::id()
-                    ));
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let tmp = std::env::temp_dir()
+                        .join(format!("strata-{}-{key}.json", std::process::id()));
                     std::fs::write(&tmp, content)?;
                     let digest = upload_blob(&client, &registry, &repo, &token, &tmp).await?;
                     println!("  uploaded {key} layer {digest}");
@@ -167,11 +166,18 @@ pub async fn push(
             layers.extend(extra_layers);
         }
     }
-    let url = format!("{}/v2/{}/manifests/{tag}", registry.trim_end_matches('/'), repo);
+    let url = format!(
+        "{}/v2/{}/manifests/{tag}",
+        registry.trim_end_matches('/'),
+        repo
+    );
     let resp = client
         .put(&url)
         .header(AUTHORIZATION, format!("Bearer {token}"))
-        .header(CONTENT_TYPE, "application/vnd.docker.distribution.manifest.v2+json")
+        .header(
+            CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
         .json(&manifest)
         .send()
         .await

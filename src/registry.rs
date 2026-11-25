@@ -117,14 +117,16 @@ pub fn scan(root: &Path) -> Vec<ModelEntry> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let has_projector = std::fs::read_dir(&dir).map(|rd| {
-            rd.flatten().any(|f| {
-                f.file_name()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .starts_with("mmproj")
+        let has_projector = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten().any(|f| {
+                    f.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("mmproj")
+                })
             })
-        }).unwrap_or(false);
+            .unwrap_or(false);
         let digest = ModelEntry::digest(&arch, &name, file_bytes, context, parameter_count);
         let families = if arch == "unknown" {
             Vec::new()
@@ -276,8 +278,7 @@ pub fn safe_name(name: &str) -> anyhow::Result<String> {
 /// Files are hard-linked where the filesystem allows it, so two tags of one
 /// model do not each consume 20 GB. A cross-device link falls back to a copy.
 pub fn copy(root: &Path, from: &str, to: &str) -> anyhow::Result<()> {
-    let src = resolve(root, from)
-        .ok_or_else(|| anyhow::anyhow!("model '{from}' not found"))?;
+    let src = resolve(root, from).ok_or_else(|| anyhow::anyhow!("model '{from}' not found"))?;
     let src_dir = src
         .parent()
         .ok_or_else(|| anyhow::anyhow!("model '{from}' has no directory"))?;
@@ -292,7 +293,10 @@ pub fn copy(root: &Path, from: &str, to: &str) -> anyhow::Result<()> {
         println!(
             "copying {} ({:.1} MB)",
             dst.file_name().unwrap_or_default().to_string_lossy(),
-            entry.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0)
+            entry
+                .metadata()
+                .map(|m| m.len() as f64 / 1e6)
+                .unwrap_or(0.0)
         );
         if std::fs::hard_link(entry.path(), &dst).is_err() {
             std::fs::copy(entry.path(), &dst)?;
@@ -384,7 +388,10 @@ pub fn create_from_blobs(
         has_gguf |= clean.to_ascii_lowercase().ends_with(".gguf");
     }
     anyhow::ensure!(has_gguf, "at least one file must be a .gguf");
-    std::fs::write(dir.join("strata.json"), serde_json::to_string_pretty(overrides)?)?;
+    std::fs::write(
+        dir.join("strata.json"),
+        serde_json::to_string_pretty(overrides)?,
+    )?;
     tag(root, name, &safe_name(name)?)?;
     Ok(())
 }
@@ -401,10 +408,13 @@ pub fn tag(root: &Path, logical: &str, stored: &str) -> anyhow::Result<()> {
 
 /// Read the Modelfile overrides stored beside a derived model.
 pub fn overrides(root: &Path, name: &str) -> serde_json::Value {
-    std::fs::read_to_string(root.join(safe_name(name).unwrap_or_default()).join("strata.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::Value::Null)
+    std::fs::read_to_string(
+        root.join(safe_name(name).unwrap_or_default())
+            .join("strata.json"),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// `strata create <name> -f Modelfile`.
@@ -515,7 +525,10 @@ mod tests {
         std::fs::write(blobs.join(format!("sha256-{digest}")), b"gguf bytes").unwrap();
 
         let mut files = serde_json::Map::new();
-        files.insert("model.gguf".into(), serde_json::json!(format!("sha256:{digest}")));
+        files.insert(
+            "model.gguf".into(),
+            serde_json::json!(format!("sha256:{digest}")),
+        );
         create_from_blobs(&root, "from-blob", &files, &serde_json::json!({})).unwrap();
         assert_eq!(
             std::fs::read(root.join("from-blob").join("model.gguf")).unwrap(),

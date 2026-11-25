@@ -39,8 +39,3 @@ pub fn select(arch: &str) -> Backend {
         _ => Backend::LlamaCpp,
     }
 }
-
-/// Whether a backend is the universal fallback.
-pub fn is_fallback(b: Backend) -> bool {
-    b == Backend::LlamaCpp
-}

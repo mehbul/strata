@@ -68,7 +68,10 @@ impl Hub {
         // 2. A blob Ollama has already downloaded, found through its manifests.
         if let Some(blob) = ollama_blob(model) {
             std::fs::create_dir_all(&out)?;
-            self.say(format!("hub: Ollama has {model} ({:.1} GB)", file_gb(&blob)));
+            self.say(format!(
+                "hub: Ollama has {model} ({:.1} GB)",
+                file_gb(&blob)
+            ));
             self.say(format!("     {} -> {}", blob.display(), dest.display()));
             std::fs::copy(&blob, &dest)
                 .with_context(|| format!("copying {} to {}", blob.display(), dest.display()))?;
@@ -157,7 +160,7 @@ impl Hub {
             .chars()
             .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '/' | '.'))
             .collect();
-        kept.replace(':', "_").replace('/', "_").replace("..", "_")
+        kept.replace([':', '/'], "_").replace("..", "_")
     }
 
     /// Pull a model straight from Ollama's public registry. No Ollama install
@@ -180,13 +183,15 @@ impl Hub {
         self.say(format!("hub: pulling manifest for {repo}:{tag}"));
 
         let manifest_url = format!("{base}/v2/{repo}/manifests/{tag}");
-        let mut request = client
-            .get(&manifest_url)
-            .header("Accept", "application/vnd.docker.distribution.manifest.v2+json");
+        let mut request = client.get(&manifest_url).header(
+            "Accept",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        );
         if let Some(token) = crate::auth::token() {
             request = request.bearer_auth(token);
         }
-        let resp = request.send()
+        let resp = request
+            .send()
             .await
             .with_context(|| format!("GET {manifest_url}"))?;
         if !resp.status().is_success() {
@@ -210,7 +215,10 @@ impl Hub {
         let mut license = String::new();
         let mut parameters = serde_json::Map::new();
         let mut total: u64 = 0;
-        let wanted: u64 = layers.iter().filter_map(|l| l.get("size").and_then(Value::as_u64)).sum();
+        let wanted: u64 = layers
+            .iter()
+            .filter_map(|l| l.get("size").and_then(Value::as_u64))
+            .sum();
 
         for layer in layers {
             let media = layer.get("mediaType").and_then(Value::as_str).unwrap_or("");
@@ -270,11 +278,21 @@ impl Hub {
             }
         }
         let mut overrides = serde_json::Map::new();
-        if !system.is_empty() { overrides.insert("system".into(), json!(system)); }
-        if !template.is_empty() { overrides.insert("template".into(), json!(template)); }
-        if !renderer.is_empty() { overrides.insert("renderer".into(), json!(renderer)); }
-        if !parser.is_empty() { overrides.insert("parser".into(), json!(parser)); }
-        if !license.is_empty() { overrides.insert("license".into(), json!(license)); }
+        if !system.is_empty() {
+            overrides.insert("system".into(), json!(system));
+        }
+        if !template.is_empty() {
+            overrides.insert("template".into(), json!(template));
+        }
+        if !renderer.is_empty() {
+            overrides.insert("renderer".into(), json!(renderer));
+        }
+        if !parser.is_empty() {
+            overrides.insert("parser".into(), json!(parser));
+        }
+        if !license.is_empty() {
+            overrides.insert("license".into(), json!(license));
+        }
         if !parameters.is_empty() {
             overrides.insert("parameters".into(), Value::Object(parameters));
         }
@@ -286,7 +304,11 @@ impl Hub {
         }
         crate::registry::tag(&self.cache_dir, model, &Self::dir_name(model))?;
         let _ = (total, wanted);
-        self.say(format!("hub: {model} ready at {} ({:.1} GB)", dest.display(), file_gb(&dest)));
+        self.say(format!(
+            "hub: {model} ready at {} ({:.1} GB)",
+            dest.display(),
+            file_gb(&dest)
+        ));
         Ok(out.to_path_buf())
     }
 
@@ -320,7 +342,11 @@ impl Hub {
             file.write_all(&chunk).await?;
             done += chunk.len() as u64;
             if done >= next_report {
-                self.say(format!("  {:.1} / {:.1} GB", done as f32 / 1e9, size as f32 / 1e9));
+                self.say(format!(
+                    "  {:.1} / {:.1} GB",
+                    done as f32 / 1e9,
+                    size as f32 / 1e9
+                ));
                 next_report = done + 500_000_000;
             }
         }
@@ -328,7 +354,10 @@ impl Hub {
         drop(file);
         let got = crate::blob::sha256_hex(std::fs::File::open(&partial)?)?;
         let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
-        anyhow::ensure!(got == expected, "digest mismatch for {digest}: got sha256:{got}");
+        anyhow::ensure!(
+            got == expected,
+            "digest mismatch for {digest}: got sha256:{got}"
+        );
         tokio::fs::rename(&partial, dest).await?;
         Ok(())
     }

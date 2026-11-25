@@ -168,9 +168,8 @@ impl Compactor {
     /// Prefer Strata's tokenizer over the runtime's `/tokenize`. A bad path
     /// leaves the upstream path in place rather than breaking compaction.
     pub fn with_tokenizer(mut self, model_path: Option<&std::path::Path>) -> Self {
-        self.local = model_path.and_then(|p| {
-            crate::tokenizer::Tokenizer::from_gguf(&p.to_string_lossy()).ok()
-        });
+        self.local = model_path
+            .and_then(|p| crate::tokenizer::Tokenizer::from_gguf(&p.to_string_lossy()).ok());
         self
     }
 

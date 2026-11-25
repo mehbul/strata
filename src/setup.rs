@@ -64,9 +64,6 @@ pub struct Choice {
     pub disk_share: f32,
     /// Weights this machine can hold without touching disk, at this context.
     pub ceiling_gb: f32,
-    /// True when the weights fit in VRAM plus host RAM, so nothing streams from
-    /// disk. False means it will run, but slowly enough to be worth saying so.
-    pub fits_in_memory: bool,
     pub vram_gb: f32,
     pub ram_gb: f32,
 }
@@ -110,11 +107,10 @@ pub fn choose_context(
         (vram_bytes * KV_SHARE_OF_VRAM as f64) as u64
     };
 
-    let affordable = if kv_bytes_per_token > 0 {
-        (budget_bytes / kv_bytes_per_token) as usize
-    } else {
-        ceiling
-    };
+    let affordable = budget_bytes
+        .checked_div(kv_bytes_per_token)
+        .map(|n| n as usize)
+        .unwrap_or(ceiling);
     LADDER
         .iter()
         .rev()
@@ -177,7 +173,6 @@ pub fn plan_for(model_path: &Path, machine: &Machine) -> Result<Choice> {
         dense_gb: gib(solved.dense_bytes),
         disk_share,
         ceiling_gb,
-        fits_in_memory: solved.fits_without_disk(),
         vram_gb,
         ram_gb,
     })
@@ -293,7 +288,9 @@ pub async fn run(
         println!("\n{} already exists — keeping it.", tuned.display());
         println!("Pass --force to measure again.");
     } else {
-        println!("\nMeasuring the expert/layer split for this machine. This loads the model once per");
+        println!(
+            "\nMeasuring the expert/layer split for this machine. This loads the model once per"
+        );
         println!("configuration and takes a while; it is done once.\n");
         crate::tune::run(&model, choice.ctx, None, true).await?;
     }

@@ -23,6 +23,7 @@ pub struct ExpertPlan {
 
 impl ExpertPlan {
     /// What `-ncmoe n` means: the first `n` layers.
+    #[cfg(test)]
     pub fn first_n(n: usize, total_layers: usize) -> Self {
         let n = n.min(total_layers);
         Self {
@@ -42,14 +43,17 @@ impl ExpertPlan {
         }
     }
 
+    #[cfg(test)]
     pub fn cpu_layers(&self) -> &[usize] {
         &self.cpu_layers
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cpu_layers.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.cpu_layers.is_empty()
     }

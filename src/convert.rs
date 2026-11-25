@@ -93,8 +93,7 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
 pub fn convert(dir: &str, output: &str) -> Result<()> {
     let dir = std::path::Path::new(dir);
     let config: Value = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("config.json"))
-            .with_context(|| "reading config.json")?,
+        &std::fs::read_to_string(dir.join("config.json")).with_context(|| "reading config.json")?,
     )?;
     let arch = config
         .get("architectures")
@@ -103,7 +102,7 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("LlamaForCausalLM")
         .strip_suffix("ForCausalLM")
-        .unwrap_or_else(|| "llama")
+        .unwrap_or("llama")
         .to_ascii_lowercase();
     let layers = config
         .get("num_hidden_layers")
@@ -152,12 +151,16 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
     let mut tensors = Vec::new();
     for file in &files {
         let bytes = std::fs::read(file)?;
-        if bytes.len() < 8 { bail!("short safetensors file {}", file.display()) }
+        if bytes.len() < 8 {
+            bail!("short safetensors file {}", file.display())
+        }
         let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         let header: Value = serde_json::from_slice(&bytes[8..8 + header_len])?;
         let base = 8 + header_len;
         for (name, meta) in header.as_object().unwrap_or(&serde_json::Map::new()) {
-            if name == "__metadata__" { continue }
+            if name == "__metadata__" {
+                continue;
+            }
             let dtype = match meta.get("dtype").and_then(Value::as_str) {
                 Some("F32") => 0u32,
                 Some("F16") => 1u32,
@@ -173,13 +176,25 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
             let offsets: Vec<usize> = meta
                 .get("data_offsets")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_u64)
+                        .map(|x| x as usize)
+                        .collect()
+                })
                 .unwrap_or_default();
-            if offsets.len() != 2 { bail!("tensor {name} has no data_offsets") }
+            if offsets.len() != 2 {
+                bail!("tensor {name} has no data_offsets")
+            }
             let data = bytes[base + offsets[0]..base + offsets[1]].to_vec();
             let mut dims = shape;
             dims.reverse(); // safetensors row-major → GGUF dimension order
-            tensors.push(Tensor { name: name.clone(), dims, dtype, bytes: data });
+            tensors.push(Tensor {
+                name: name.clone(),
+                dims,
+                dtype,
+                bytes: data,
+            });
         }
     }
     tensors.sort_by(|a, b| a.name.cmp(&b.name));
@@ -193,7 +208,10 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
     out.extend_from_slice(&(kv_count as u64).to_le_bytes());
     let metadata: Vec<(String, Value)> = vec![
         ("general.architecture".into(), json!(arch)),
-        ("general.name".into(), json!(&config["model_type"].as_str().unwrap_or("converted"))),
+        (
+            "general.name".into(),
+            json!(&config["model_type"].as_str().unwrap_or("converted")),
+        ),
         ("general.file_type".into(), json!(0u64)),
         (format!("{arch}.block_count"), json!(layers)),
         (format!("{arch}.context_length"), json!(ctx)),
@@ -209,8 +227,14 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
         put_value(&mut out, v);
     }
     if let Some((tokens, merges, types)) = tokenizer {
-        let bos = config.get("bos_token_id").and_then(Value::as_u64).unwrap_or(1) as u32;
-        let eos = config.get("eos_token_id").and_then(Value::as_u64).unwrap_or(2) as u32;
+        let bos = config
+            .get("bos_token_id")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32;
+        let eos = config
+            .get("eos_token_id")
+            .and_then(Value::as_u64)
+            .unwrap_or(2) as u32;
         for (key, value) in [
             ("tokenizer.ggml.tokens".to_string(), 0u8),
             ("tokenizer.ggml.merges".to_string(), 1),
@@ -239,8 +263,12 @@ pub fn convert(dir: &str, output: &str) -> Result<()> {
         out.extend_from_slice(&offset.to_le_bytes());
         offset += t.bytes.len() as u64;
     }
-    while out.len() % 32 != 0 { out.push(0); }
-    for t in &tensors { out.extend_from_slice(&t.bytes); }
+    while out.len() % 32 != 0 {
+        out.push(0);
+    }
+    for t in &tensors {
+        out.extend_from_slice(&t.bytes);
+    }
     std::fs::write(output, out)?;
     println!("wrote {output} ({} tensors)", tensors.len());
     Ok(())
